@@ -1,0 +1,216 @@
+"""The `loopy` command.
+
+    loopy                     start the assistant
+    loopy setup               download the models (run once after pip install)
+    loopy setup --voice ID    download a specific voice
+    loopy voices              list available voices
+    loopy say TEXT            speak a line, to test the voice
+    loopy chat                talk to Loopy by typing (same brain, no mic needed)
+    loopy hear                test the microphone, wake word and speech recognition
+"""
+
+import argparse
+import sys
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="loopy", description="Local desktop voice assistant.")
+    sub = parser.add_subparsers(dest="command")
+    sub.add_parser("run", help="start Loopy (the default)")
+    setup = sub.add_parser("setup", help="download the models Loopy needs")
+    setup.add_argument("--voice", help="voice id to download and use (see 'loopy voices')")
+    setup.add_argument("--force", action="store_true", help="re-download even if already installed")
+    sub.add_parser("voices", help="list the available voices")
+    say = sub.add_parser("say", help="speak a line of text, to test the voice")
+    say.add_argument("text", nargs="+")
+    say.add_argument("--voice", help="voice id to use")
+    chat = sub.add_parser("chat", help="talk to Loopy by typing (no mic needed)")
+    chat.add_argument("--speak", action="store_true", help="also speak Loopy's replies aloud")
+    sub.add_parser("hear", help="test the microphone: prints what Loopy hears, live")
+    args = parser.parse_args(argv)
+
+    if args.command == "setup":
+        return _setup(args.voice, args.force)
+    if args.command == "voices":
+        return _voices()
+    if args.command == "say":
+        return _say(" ".join(args.text), args.voice)
+    if args.command == "chat":
+        return _chat(args.speak)
+    if args.command == "hear":
+        return _hear()
+
+    from loopy.app import run
+
+    return run()
+
+
+def _setup(voice_id: str | None, force: bool) -> int:
+    from loopy import models, settings
+
+    voice = models.get_voice(voice_id) if voice_id else settings.selected_voice()
+    if voice is None:
+        print(f"Unknown voice '{voice_id}'. See: loopy voices")
+        return 1
+
+    print(f"Installing models into {models.DATA_DIR}")
+    print(f"Voice: {voice.label}")
+    if voice.installed and not force:
+        print("  already installed")
+    else:
+        try:
+            models.install_voice(voice, force=force, progress=_print_progress)
+            print()
+        except OSError as exc:
+            print(f"\nDownload failed: {exc}\nCheck your internet connection and run 'loopy setup' again.")
+            return 1
+    if voice_id:
+        settings.save(voice=voice.id)
+
+    print(f"Speech recognition (Whisper {models.STT_MODEL}):")
+    if models.stt_installed() and not force:
+        print("  already installed")
+    else:
+        try:
+            models.install_stt(force=force)
+        except Exception as exc:  # huggingface_hub raises its own error types
+            print(f"\nDownload failed: {exc}\nCheck your internet connection and run 'loopy setup' again.")
+            return 1
+
+    print(f"Conversation model ({models.LLM_NAME}, ~1.9 GB):")
+    if models.llm_installed() and not force:
+        print("  already installed")
+    else:
+        try:
+            models.install_llm(force=force, progress=_print_progress)
+            print()
+        except OSError as exc:
+            print(f"\nDownload failed: {exc}\nCheck your internet connection and run 'loopy setup' again.")
+            return 1
+    print("Done. Start Loopy with: loopy")
+    return 0
+
+
+def _chat(speak: bool) -> int:
+    from loopy import models, settings
+
+    if not models.llm_installed():
+        print("The conversation model isn't installed yet. Run: loopy setup")
+        return 1
+    from loopy.brain import Brain
+
+    speaker = None
+    if speak and (voice := settings.active_voice()):
+        from loopy.tts import Speaker
+
+        speaker = Speaker(voice.path)
+
+    print("Loading Loopy's brain...")
+    brain = Brain(models.llm_path())
+    brain.load()
+    print("Type to chat with Loopy. Ctrl+C to quit.\n")
+    try:
+        while True:
+            text = input("you> ").strip()
+            if not text:
+                continue
+            print("loopy> ", end="", flush=True)
+            stream = speaker.stream() if speaker else None
+
+            def on_text(piece: str) -> None:  # printed (and spoken) as it's written
+                print(piece, end="", flush=True)
+                if stream:
+                    stream.feed(piece)
+
+            turn = brain.respond(text, on_text)
+            if turn.result and not turn.result.ok:
+                on_text(f" {turn.result.message}")
+            if stream:
+                stream.close()
+            print()
+            if turn.result:
+                print(f"  [{'done' if turn.result.ok else 'failed'}: {turn.result.message}]")
+    except (KeyboardInterrupt, EOFError):
+        print("\nBye!")
+    finally:
+        if speaker:
+            speaker.close()
+    return 0
+
+
+def _hear() -> int:
+    from loopy import models
+
+    if not models.stt_installed():
+        print("Speech recognition isn't installed yet. Run: loopy setup")
+        return 1
+    import queue
+
+    from loopy import wake
+    from loopy.listener import Listener
+    from loopy.stt import Transcriber
+
+    transcriber = Transcriber(models.stt_path())
+    transcriber.load()
+    utterances: queue.Queue = queue.Queue()
+    listener = Listener(on_utterance=utterances.put, on_speech_start=lambda: print("  (hearing speech...)"))
+    listener.start()
+    print('Listening. Try "Hey Loopy, how are you?". Press Ctrl+C to stop.\n')
+    try:
+        while True:
+            try:
+                audio = utterances.get(timeout=0.2)  # timeout keeps Ctrl+C responsive
+            except queue.Empty:
+                continue
+            text = transcriber.transcribe(audio)
+            if not text:
+                print("  (too short / just noise)")
+                continue
+            woke, rest = wake.split_wake(text)
+            print(f'  heard: "{text}"   wake word: {"yes" if woke else "no"}'
+                  + (f'   -> Loopy gets: "{rest}"' if woke and rest else ""))
+    except KeyboardInterrupt:
+        print("\nStopped.")
+    finally:
+        listener.stop()
+    return 0
+
+
+def _voices() -> int:
+    from loopy import models, settings
+
+    current = settings.active_voice()
+    for v in models.VOICES:
+        mark = "*" if v == current else " "
+        state = "installed" if v.installed else "not downloaded"
+        print(f" {mark} {v.id:<36} {v.label:<28} {state}")
+    print("\n* = current voice. Download one with: loopy setup --voice <id>")
+    print("You can also switch voices from Loopy's right-click menu.")
+    return 0
+
+
+def _say(text: str, voice_id: str | None) -> int:
+    from loopy import models, settings
+
+    voice = models.get_voice(voice_id) if voice_id else settings.active_voice()
+    if voice is None or not voice.installed:
+        print("That voice isn't installed yet. Run: loopy setup" + (f" --voice {voice_id}" if voice_id else ""))
+        return 1
+    from loopy.tts import Speaker
+
+    Speaker(voice.path).speak(text)
+    return 0
+
+
+def _print_progress(done: int, total: int) -> None:
+    mb = done / 1_048_576
+    if total:
+        frac = done / total
+        line = f"\r  [{'#' * int(frac * 30):<30}] {frac:4.0%} {mb:5.1f} MB"
+    else:
+        line = f"\r  {mb:5.1f} MB"
+    print(line, end="", flush=True)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

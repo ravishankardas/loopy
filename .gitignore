@@ -1,0 +1,21 @@
+# Secrets: never commit API keys
+.env
+.env.*
+
+# Python virtual environment
+.venv/
+venv/
+
+# Python caches and build output
+__pycache__/
+*.py[cod]
+build/
+dist/
+*.egg-info/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini

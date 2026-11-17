@@ -1,0 +1,26 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "loopy"
+version = "0.1.0"
+description = "A fully local desktop voice assistant with a paperclip mascot."
+requires-python = ">=3.10"
+dependencies = [
+    "PySide6>=6.6",
+    "piper-tts>=1.2",
+    "sounddevice>=0.4",
+    "numpy",
+    "platformdirs>=4",
+    "faster-whisper>=1.0",
+    # PyPI only has source builds (needs a C++ compiler). Prebuilt CPU wheels:
+    #   pip install loopy --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu
+    "llama-cpp-python>=0.3",
+]
+
+[project.scripts]
+loopy = "loopy.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/loopy"]
