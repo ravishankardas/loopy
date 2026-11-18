@@ -1,6 +1,28 @@
 Loopy TODO
 ==========
 
+[ ] Make loading the Llama model faster
+    Now: 85-101 s from start until Loopy says hello on this laptop
+    (i5-10210U, 8 GB RAM, often <1 GB free while loading).
+
+    First measure where the time goes (Brain.load in brain.py):
+    - reading the 1.9 GB model file into memory, vs.
+    - the warm-up: processing the system prompt + examples (~1,500+ tokens
+      at ~26 tokens/s is roughly a minute on its own).
+
+    Ideas, likely biggest win first:
+    - Cache the warm-up: after the first start, save llama.cpp's state for
+      the prompt + examples to disk (Llama.save_state / load_state) and load
+      it on later starts instead of re-processing; redo it only when the
+      prompt changes (key the file by a hash of the prompt).
+    - Shorter prompt and fewer examples (fine-tuning, below, would let the
+      prompt shrink a lot).
+    - Use all 8 threads for prompt processing (n_threads_batch=8), keep 4
+      for generating replies.
+    - Avoid swapping: free RAM before starting (VS Code + Chrome take ~1.3 GB),
+      try use_mlock=True so the model stays in RAM.
+    - Smaller quant (Q4_0 / Q3_K_M) only if quality holds up in the tests.
+
 [ ] Fine-tune the conversation model (Llama 3.2 3B)
     Goal: personality and tag use ([none] / [ask: ...] / [do: ...]) baked in,
     so the system prompt can be much shorter (faster startup warm-up).
