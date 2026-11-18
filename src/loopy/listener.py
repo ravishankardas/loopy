@@ -120,7 +120,12 @@ class Listener:
         while (chunk := self._frames.get()) is not None:
             pending = np.concatenate([pending, chunk])
             while len(pending) >= FRAME:
-                self.feed(pending[:FRAME])
+                try:
+                    self.feed(pending[:FRAME])
+                except Exception as exc:
+                    # Never let one bad frame kill the thread: Loopy would go deaf.
+                    print(f"[loopy] listener error (still listening): {exc!r}", flush=True)
+                    self._reset()
                 pending = pending[FRAME:]
 
     def _reset(self) -> None:

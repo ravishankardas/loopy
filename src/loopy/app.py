@@ -23,6 +23,11 @@ from loopy.models import Voice
 DEFAULT_SLEEP_AFTER = 60  # seconds without activity before Loopy dozes off
 
 
+def _log(text: str = "", end: str = "\n") -> None:
+    """The conversation, printed in the terminal Loopy was started from."""
+    print(text, end=end, flush=True)
+
+
 class Assistant(QObject):
     # Emitted from worker threads; Qt delivers them on the UI thread.
     _speech_started = Signal(str)            # first words of an utterance
@@ -134,7 +139,12 @@ class Assistant(QObject):
         elif self.listener is None:
             status = ("Microphone unavailable", Activity.IDLE)
         elif not self.awake:
-            status = ('Asleep · say "Hey Loopy"', Activity.SLEEPING)
+            if self._transcribing:
+                status = ("Was that my name?", Activity.BUSY)
+            elif self._hearing:
+                status = ("Hmm? Listening...", Activity.LISTENING)
+            else:
+                status = ('Asleep · say "Hey Loopy"', Activity.SLEEPING)
         elif self._speaking:
             status = ("Talking · still thinking" if self._thinking else "Talking", Activity.SPEAKING)
         elif self._thinking:
@@ -156,6 +166,8 @@ class Assistant(QObject):
     # -------------------------------------------------------- awake / asleep
 
     def wake_up(self, greet: bool = True) -> None:
+        if not self.awake:
+            _log("── Loopy woke up ──")
         self.awake = True
         if self.mascot.state() == State.SLEEPING:
             self.mascot.set_state(State.IDLE)
@@ -166,6 +178,8 @@ class Assistant(QObject):
         self._refresh_status()
 
     def go_to_sleep(self) -> None:
+        if self.awake:
+            _log("── Loopy fell asleep ──")
         self.awake = False
         self._hearing = False
         self._sleep_timer.stop()
@@ -190,9 +204,10 @@ class Assistant(QObject):
     # ------------------------------------------------------------ listening
 
     def _on_speech_detected(self) -> None:
-        if not self.awake:
-            return
         self._hearing = True
+        if not self.awake:
+            self._refresh_status()  # asleep: show it heard something
+            return
         if self.mascot.state() == State.IDLE:
             self.mascot.set_state(State.LISTENING)
             self.mascot.show_bubble("", 0)
@@ -204,9 +219,9 @@ class Assistant(QObject):
         if len(audio) == 0:  # too short to be speech
             self._back_to_rest()
             return
+        self._transcribing = True
         if self.awake:
             self._busy()
-            self._transcribing = True
             self.mascot.set_state(State.WORKING)
         self._refresh_status()
         threading.Thread(target=lambda: self._heard.emit(self.transcriber.transcribe(audio)), daemon=True).start()
@@ -215,6 +230,11 @@ class Assistant(QObject):
         self._transcribing = False
         self._refresh_status()
         woke, rest = wake.split_wake(text)
+        if text:
+            if self.awake or woke:
+                _log(f"You:   {text}")
+            else:
+                _log(f'       (asleep, ignored: "{text}")')
         if not self.awake:
             if woke:  # "Hey Loopy" or "Hey Loopy, <anything>"
                 self.wake_up(greet=not rest)
@@ -258,17 +278,25 @@ class Assistant(QObject):
         self._refresh_status()
 
         stream = self._open_speech() if self.speaker else None
-        out = stream.feed if stream else self._thought.emit
+        speak = stream.feed if stream else self._thought.emit
         self._spoken = ""
 
+        def out(piece: str) -> None:  # to the voice and the terminal, as it's written
+            speak(piece)
+            _log(piece, end="")
+
         def work():
+            _log("Loopy: ", end="")
             try:
                 turn = self.brain.respond(text, on_text=out)
                 if turn.result is not None and not turn.result.ok:
                     out(f" {turn.result.message}")  # e.g. "Chrome isn't open."
+                _log()
+                if turn.action:
+                    _log(f"       [{'done' if turn.result.ok else 'failed'}: {turn.result.message}]")
             except Exception as exc:  # keep Loopy alive whatever happens
-                print(f"[loopy] brain error: {exc}")
                 out(" Sorry, my brain got a bit tangled. Can you say that again?")
+                _log(f"\n       [brain error: {exc!r}]")
                 turn = None
             finally:
                 if stream:
@@ -287,7 +315,8 @@ class Assistant(QObject):
 
     def _ask_by_typing(self) -> None:
         text, ok = QInputDialog.getText(self.mascot, "Loopy", "Say something to Loopy:")
-        if ok:
+        if ok and text.strip():
+            _log(f"You:   {text.strip()}   (typed)")
             if not self.awake:
                 self.wake_up(greet=False)
             self.think(text)
@@ -304,6 +333,7 @@ class Assistant(QObject):
 
     def say(self, text: str) -> None:
         """Speak `text` aloud (or just show it, if no voice is installed)."""
+        _log(f"Loopy: {text}")
         if self.speaker is None:
             self.mascot.show_bubble(text)
             self._keep_awake()
@@ -450,6 +480,11 @@ def _quit_on_ctrl_c(app: QApplication) -> QTimer:
 
 
 def run() -> int:
+    # The Windows console can't encode some characters a model may write
+    # (curly quotes, accents...); print a "?" instead of crashing.
+    for s in (sys.stdout, sys.stderr):
+        if hasattr(s, "reconfigure"):
+            s.reconfigure(errors="replace")
     app = QApplication(sys.argv)
     mascot = Mascot()
     assistant = Assistant(mascot)

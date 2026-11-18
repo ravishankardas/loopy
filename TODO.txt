@@ -1,0 +1,24 @@
+Loopy TODO
+==========
+
+[ ] Fine-tune the conversation model (Llama 3.2 3B)
+    Goal: personality and tag use ([none] / [ask: ...] / [do: ...]) baked in,
+    so the system prompt can be much shorter (faster startup warm-up).
+    Ask-before-acting stays enforced in code, so a fine-tune can't bypass it.
+
+    Data (the hard part):
+    - Save Loopy's real conversations to a JSONL file in chat format
+      (system prompt, user turn, tagged assistant reply).
+    - Fix the replies that weren't good; a few hundred good examples is enough.
+    - Optionally write some by hand, or generate with a bigger model and review.
+
+    Training (needs a GPU; the laptop's MX250 is too small):
+    - Free GPU: Google Colab or Kaggle (T4).
+    - LoRA / QLoRA with Unsloth (has Llama 3.2 3B notebooks).
+    - Base model: meta-llama/Llama-3.2-3B-Instruct on Hugging Face
+      (accept Meta's license on the model page first).
+
+    Back into Loopy:
+    - Export to GGUF at Q4_K_M, replace the file in %LOCALAPPDATA%\loopy\llm\
+      (or keep the base model and load the adapter via Llama(..., lora_path=...)).
+    - Re-run the safety and conversation tests before switching.
