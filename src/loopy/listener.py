@@ -36,13 +36,15 @@ MIN_SECONDS = 0.4
 # 32 ms frame would dilute a 5 ms spike), compare with a rolling 2 s
 # background level, and require a spike shape rather than a steady sound.
 KNOCK_BLOCK = 128            # samples per block (8 ms at 16 kHz)
-# Mic levels differ a lot between laptops (noise suppression, mic volume): on
-# the laptop this was tuned on, real hits peaked at only 0.01-0.04 but were
-# 20-86x louder than the room. So "louder than the room" is the main test and
-# the absolute peak is just a floor above digital silence.
-KNOCK_ABOVE_NOISE = 15.0     # block must be this many times louder than the room
+# Mic levels differ a lot between laptops (noise suppression, mic volume). On
+# the laptop this was tuned on, firm hits peaked at 0.09-0.18 and were
+# 112-464x louder than the very quiet room; false alarms (CPU-load glitches,
+# Loopy's own voice ending) peaked at 0.01-0.11.
+KNOCK_ABOVE_NOISE = 40.0     # block must be this many times louder than the room
 KNOCK_SHARPNESS = 2.0        # peak / average level: a spike (steady sounds are ~1.4)
-KNOCK_PEAK = 0.005           # quietest peak that counts
+KNOCK_PEAK = 0.05            # quietest peak that counts
+KNOCK_GLITCH_SKIP = 0.3      # seconds to ignore after the mic dropped audio (busy CPU -> clicks)
+KNOCK_RESUME_SKIP = 1.0      # seconds to ignore after the mic comes back on (Loopy's voice/clip ending)
 KNOCK_BACKGROUND_SECONDS = 2.0
 KNOCK_COOLDOWN = 2.0         # seconds; one hit triggers once
 
@@ -101,6 +103,11 @@ class Listener:
         self._background = collections.deque(maxlen=int(KNOCK_BACKGROUND_SECONDS * SAMPLE_RATE / KNOCK_BLOCK))
         self._last_knock = -1e9
         self._frames_seen = 0
+        self._glitch = False             # set by the audio thread when input was dropped
+        self._knock_skip = 0             # frames to ignore before knocks count again
+        self._was_paused = False
+        self.last_knock: tuple[float, float, float] | None = None  # (peak, x room, sharpness)
+        self.knocks_enabled = True       # off e.g. while the model loads (CPU flat out -> clicks)
         self._vad: VoiceDetector | None = None
         self._paused = threading.Event()
         self._frames: queue.Queue[np.ndarray | None] = queue.Queue()
@@ -131,6 +138,11 @@ class Listener:
             self._thread.join(2)
             self._thread = None
 
+    def enable_knocks(self, after: float = 0.0) -> None:
+        """Start reacting to knocks, `after` seconds from now."""
+        self._knock_skip = max(self._knock_skip, int(after * SAMPLE_RATE / FRAME))
+        self.knocks_enabled = True
+
     def pause(self) -> None:
         self._paused.set()
 
@@ -139,7 +151,9 @@ class Listener:
 
     # ------------------------------------------------------------- pipeline
 
-    def _callback(self, indata, _frames, _time, _status) -> None:
+    def _callback(self, indata, _frames, _time, status) -> None:
+        if status and status.input_overflow:
+            self._glitch = True  # audio was dropped (busy CPU): the gap sounds like a click
         self._frames.put(indata[:, 0].copy())  # keep the audio thread light
 
     def _run(self) -> None:
@@ -187,9 +201,17 @@ class Listener:
         peak, above_noise, sharpness = self.knock_score(frame)
         self._frames_seen += 1
         now = self._frames_seen * FRAME / SAMPLE_RATE
+        if self._glitch:
+            self._glitch = False
+            self._knock_skip = max(self._knock_skip, int(KNOCK_GLITCH_SKIP * SAMPLE_RATE / FRAME))
+        skipping = self._knock_skip > 0
+        if skipping:
+            self._knock_skip -= 1
         learned = len(self._background) >= self._background.maxlen // 2   # ~1 s of room first
         is_knock = (
-            learned
+            self.knocks_enabled
+            and learned
+            and not skipping
             and peak >= self.knock_peak
             and above_noise >= self.knock_above_noise
             and sharpness >= KNOCK_SHARPNESS
@@ -198,6 +220,7 @@ class Listener:
         )
         if is_knock:
             self._last_knock = now
+            self.last_knock = (peak, above_noise, sharpness)
             if self._on_knock:
                 self._on_knock(peak)
         elif above_noise < self.knock_above_noise:
@@ -208,9 +231,15 @@ class Listener:
     def feed(self, frame: np.ndarray) -> None:
         """Process one 512-sample frame (public so tests can drive it)."""
         if self._paused.is_set():
+            self._was_paused = True
             if self._speaking or self._preroll:
                 self._reset()  # drop anything half-heard
             return
+        if self._was_paused:
+            # Just back on after Loopy's voice or a clip: its tail end (or the
+            # speaker switching off) can click, so don't count knocks yet.
+            self._was_paused = False
+            self._knock_skip = max(self._knock_skip, int(KNOCK_RESUME_SKIP * SAMPLE_RATE / FRAME))
 
         prob = self._vad(frame)
         self._check_knock(frame, prob)

@@ -87,6 +87,8 @@ If asked for something you can't do, say so kindly and stay in the conversation.
 When asked what you can do (or how you can help), tell them all of it: you can {abilities()}.
 
 You can play tic-tac-toe with the user on a board that appears on screen (no permission needed).
+Speech recognition often mishears it ("tiktok toe", "tick tock toe", "tic tac"). When they want to play, reply with [game: start]
+and the real board appears. Never draw a board in text and never play a game in words yourself.
 Cells are numbered 1 to 9: 1 top-left, 2 top-middle, 3 top-right, 4 middle-left, 5 center, 6 middle-right,
 7 bottom-left, 8 bottom-middle, 9 bottom-right. The user is X, you are O. When you name a cell in a comment, use these names.
 Try to win: get three O's in a row, and block the user when they have two X's in a row.
@@ -133,6 +135,8 @@ def _examples() -> list[dict]:
         a("[none] I wish I could, but timers aren't something I can do yet. What's the timer for?"),
         u("open the browser"), a("[ask: open chrome] Want me to open Chrome?"),
         u("no never mind"), a("[none] No problem! So, what's on your mind?"),
+        u("play that tiktok toe game"), a("[game: start] Ooh, tic-tac-toe! Let's go!"),
+        u("let's stop playing"), a("[game: stop] Okay, good game!"),
         # A short tic-tac-toe game, including a rejected move.
         u("i'm ready to play tic tac toe"), a("[game: start] Yay, game time!"),
         {"role": "system", "content": "Tic-tac-toe game started. The user is X, you are O. The user goes first."},
@@ -262,8 +266,15 @@ class Brain:
                     if numbers and not any(re.search(rf"(?<![\d.]){re.escape(n)}(?![\d.])", gate.spoken) for n in numbers):
                         gate.say(f"To be exact: {value}.")
 
-            if gate.kind in ("none", "ask", "do") and not gate.spoken and not checked:
+            if gate.fake_board and gate.kind == "none" and (self.game is None or self.game.over):
+                # It drew a board in text instead of starting the game
+                # ("Here's the board: 1 | 2 | 3"): that's what it meant, so start
+                # the real one. (The text board itself was never spoken.)
+                gate.kind, gate.game_cmd = "game", "start"
+
+            if gate.kind == "none" and not gate.spoken and not checked:
                 # Still nothing after every retry: Loopy must never go silent.
+                # ([ask]/[do] always get Loopy's own words in _decide.)
                 gate.say("Sorry, I lost my train of thought. Could you say that again?")
 
             if gate.kind in ("game", "move"):
@@ -423,7 +434,9 @@ class Brain:
         again, up to EMPTY_RETRIES more times."""
         for attempt in range(1 + EMPTY_RETRIES):
             gate = self._generate(llm, on_text, validate_play)
-            wordless = gate.kind in ("check", "move", "game")      # these have nothing after the tag
+            # These need no words from the model: nothing goes after the tag, or
+            # (for a real [ask: action]) Loopy asks its own question if needed.
+            wordless = gate.kind in ("check", "move", "game", "ask") or gate.fake_board
             illegal = gate.kind == "play" and not (validate_play and validate_play(gate.cell))
             if gate.spoken or wordless or illegal or attempt == EMPTY_RETRIES:
                 return gate
@@ -475,6 +488,8 @@ class Brain:
         # would believe it had already done it.
         if gate.kind == "do" and gate.allowed_to_run:
             self.pending = None
+            if not gate.spoken:
+                gate.say("Okay!")
             self._remember(f"do: {gate.action}", gate.spoken)
             result = actions.run(gate.action)
             self._history.append({"role": "system", "content": f"Action done: {gate.action}. Result: {result.message}"})
@@ -526,6 +541,9 @@ class _Gate:
         self._pos = 0
         self._suppress = False
         self.stopped = False     # the model started writing a fake turn; ignore the rest
+        self.fake_board = False  # it started drawing a tic-tac-toe board in text
+        self._hold_ask = False   # [ask: ...]: hold the words until we know it's a question
+        self._ask_text = ""
 
     @property
     def halt(self) -> bool:
@@ -536,6 +554,9 @@ class _Gate:
     # A fake turn the model writes itself, e.g. "system: Result: chrome = 0% open"
     # or "...closed. user: ...": nothing from there on may be spoken.
     _ROLE = re.compile(r"(?:^|(?<=[.!?\]])\s+|\n)\s*(?:system|user|assistant)\s*:", re.IGNORECASE)
+    # A board drawn in text ("1 | 2 | 3"): the model is playing a game in words
+    # instead of starting the real one. "|" never belongs in spoken words.
+    _FAKE_BOARD = re.compile(r"[1-9XO]\s*\|")
 
     def feed(self, raw: str, final: bool = False) -> None:
         if self._body_start is None and not self._read_tag(raw):
@@ -543,10 +564,13 @@ class _Gate:
         if self.stopped:
             return
         end = len(raw)
-        role = self._ROLE.search(raw[self._body_start:])
-        if role:
-            end = max(self._pos, self._body_start + role.start())
+        body = raw[self._body_start:]
+        role, board = self._ROLE.search(body), self._FAKE_BOARD.search(body)
+        cut = min([m.start() for m in (role, board) if m], default=None)
+        if cut is not None:
+            end = max(self._pos, self._body_start + cut)
             self.stopped = True
+            self.fake_board = bool(board and board.start() == cut)
         elif not final:
             # Hold back the last, possibly unfinished word, so a "system:"
             # is recognised before any of it is spoken (costs ~1 token).
@@ -564,6 +588,14 @@ class _Gate:
         if self._held and not self._looks_like_tag(self._held) and not self._suppress:
             self._emit(self._held)  # unclosed "[" that wasn't a tag: say it after all
         self._held = ""
+        if self._hold_ask:
+            # Say the model's words only if they really ask. "I'm opening Chrome
+            # for you." would be a false claim: then only Loopy's own question
+            # is spoken (added by the caller).
+            self._hold_ask = False
+            text, self._ask_text = self._ask_text.strip(), ""
+            if "?" in text:
+                self._emit(text)
         self.spoken = self.spoken.strip()
 
     _TAG_START = re.compile(r"\[\s*(none|ask|do|check|game|move|play)\b", re.IGNORECASE)
@@ -595,6 +627,9 @@ class _Gate:
         return out
 
     def _emit(self, piece: str) -> None:
+        if self._hold_ask:
+            self._ask_text += piece  # decided in finish()
+            return
         if not self.spoken:
             piece = piece.lstrip()
         if piece:
@@ -650,6 +685,8 @@ class _Gate:
                     self._suppress = True  # illegal: its comment must not be spoken
         elif kind != "none" and action in actions.names():
             self.kind, self.action = kind, action
+            if kind == "ask":
+                self._hold_ask = True
             if kind == "do":
                 if action == self._pending:
                     self.allowed_to_run = True

@@ -153,6 +153,9 @@ class Assistant(QObject):
                 knock_peak=settings.load().get("knock_peak", KNOCK_PEAK),
                 knock_above_noise=settings.load().get("knock_above_noise", KNOCK_ABOVE_NOISE),
             )
+            # No knock detection while the model loads: the CPU is flat out,
+            # the mic drops audio, and the gaps click like a hit.
+            self.listener.knocks_enabled = self.brain is None
             try:
                 self.listener.start()
             except Exception as exc:
@@ -205,6 +208,8 @@ class Assistant(QObject):
         m.set_status(*status)
 
     def _on_brain_ready(self, error: str) -> None:
+        if self.listener:
+            self.listener.enable_knocks(after=1.0)  # loading is over; give the CPU a second to settle
         if error:
             _log(f"       [brain failed to load: {error}]")
             self.brain_error = error
@@ -519,14 +524,16 @@ class Assistant(QObject):
 
     def _on_knock(self, peak: float) -> None:
         """Someone hit the laptop: "Can I get a ho yeah!" """
-        if self._clip_playing:
-            return
+        if self._clip_playing or (self.brain and not self._brain_loaded and not self.brain_error):
+            return  # already playing, or still starting up
         from loopy.sounds import HO_YEAH, Clip
 
         if self._clip is None:
             self._clip = Clip(HO_YEAH)
             self._clip.finished.connect(self._on_clip_finished)
-        _log(f"       [knock! (peak {peak:.2f}) -> can I get a ho yeah!]")
+        info = self.listener.last_knock if self.listener else None
+        detail = f"peak {info[0]:.3f}, {info[1]:.0f}x the room, sharpness {info[2]:.1f}" if info else f"peak {peak:.3f}"
+        _log(f"       [knock! ({detail}) -> can I get a ho yeah!]")
         self._clip_playing = True
         self._clip_id += 1
         if self.speaker:

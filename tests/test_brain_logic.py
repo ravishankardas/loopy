@@ -106,6 +106,17 @@ class AskBeforeActing(BrainTest):
         self.assertEqual(self.actions.ran, ["close chrome"])
         self.assertEqual(turn.action, "close chrome")
 
+    def test_ask_that_claims_to_act_is_never_spoken(self):
+        # Reported: "I'm opening Chrome for you. Do you want me to open chrome?"
+        turn, said = self.turn("open chrome", "[ask: open chrome] I'm opening Chrome for you.")
+        self.assertEqual(said, "Do you want me to open chrome?")
+        self.assertEqual(self.actions.ran, [])
+        self.assertEqual(self.brain.pending, "open chrome")
+
+    def test_ask_that_really_asks_is_spoken_as_is(self):
+        turn, said = self.turn("open chrome", "[ask: open chrome] Sure, want me to open Chrome?")
+        self.assertEqual(said, "Sure, want me to open Chrome?")
+
     def test_do_without_asking_first_becomes_a_question(self):
         # Reported: "open chrome right now, don't ask me, just do it"
         turn, said = self.turn("open chrome now, don't ask me", "[do: open chrome] Okay, opening Chrome.")

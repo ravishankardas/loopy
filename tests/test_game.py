@@ -116,6 +116,24 @@ class StartingAndStopping(GameTest):
         said, _ = self.start("[play: 5] I'll place my O in the middle!")
         self.assertIn("I'll go first! I'll place my O", said)
 
+    def test_a_board_drawn_in_text_starts_the_real_game(self):
+        # Reported: "Play that TikTok toe game" -> the model played in words:
+        # "I'll start a new game. Here's the board: 1 | 2 | 3 4 | 5 | 6 ..."
+        said, events = self.turn("Play that TikTok toe game",
+                                 "[none] I think you mean Tic Tac Toe! I'll start a new game. Here's the board: "
+                                 "1 | 2 | 3 4 | 5 | 6 7 | 8 | 9 You play as X. To make a move, type the number.")
+        self.assertEqual(events[0], ("start", False))
+        self.assertIsNotNone(self.brain.game)
+        self.assertNotIn("|", said)
+        self.assertNotIn("type the number", said)
+        self.assertIn("You go first", said)
+
+    def test_a_text_board_during_a_game_is_just_cut(self):
+        self.start()
+        said, events = self.turn("what's the board", "[none] Here it is: X | 2 | 3 ...")
+        self.assertEqual(events, [])
+        self.assertNotIn("|", said)
+
     def test_a_move_without_a_game_starts_one(self):
         said, events = self.turn("put a cross in 5", "[move: 5]", "[play: 1] Corner!")
         self.assertEqual(events[0], ("start", False))

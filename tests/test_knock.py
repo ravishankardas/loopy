@@ -13,7 +13,8 @@ rng = np.random.default_rng(0)
 
 
 def quiet():
-    return (rng.normal(0, 0.003, N)).astype(np.float32)          # a quiet room
+    # A quiet room, as measured on the laptop this was tuned on (~0.0005).
+    return (rng.normal(0, 0.0005, N)).astype(np.float32)
 
 
 def impact(peak=0.9):
@@ -70,18 +71,52 @@ class KnockDetection(unittest.TestCase):
         self.frames(frame)
         self.assertEqual(len(self.knocks), 1)
 
-    def test_soft_tap_barely_above_the_room_is_not(self):
-        self.frames(hit(peak=0.01))                 # only a few times louder than the room
+    def test_off_while_the_model_loads(self):
+        # Requested: no knock reactions during startup, while the model loads.
+        self.mic.knocks_enabled = False
+        self.frames(hit())
+        self.assertEqual(self.knocks, [])
+        self.mic.enable_knocks(after=1.0)       # loading finished
+        self.frames(hit())                      # still settling: ignored
+        self.assertEqual(self.knocks, [])
+        self.frames(*[quiet()] * int(1.0 * RATE / N + 2))
+        self.frames(hit())
+        self.assertEqual(len(self.knocks), 1)
+
+    def test_tiny_clicks_are_not(self):
+        # Reported false alarms: "knock!" at peak 0.01 without any hit.
+        self.frames(hit(peak=0.01))
         self.assertEqual(self.knocks, [])
 
-    def test_real_hits_from_a_quiet_laptop_mic(self):
-        # Measured on the laptop this was tuned on: a very quiet room (~0.0005)
-        # and hits peaking at only 0.01-0.04, but 20-86x louder than the room.
-        mic = L.Listener(on_utterance=lambda _a: None, on_knock=self.knocks.append)
-        silent_room = lambda: (rng.normal(0, 0.0005, N)).astype(np.float32)
-        for _ in range(40):
-            mic._check_knock(silent_room(), 0.0)
-        mic._check_knock(impact(peak=0.04) + silent_room(), 0.0)
+    def test_real_firm_hits(self):
+        # Measured with `loopy knock-test`: firm hits peaked at 0.09-0.18.
+        for peak in (0.091, 0.151, 0.18):
+            self.frames(*[quiet()] * int(L.KNOCK_COOLDOWN * RATE / N + 2))
+            self.frames(hit(peak=peak))
+        self.assertEqual(len(self.knocks), 3)
+
+    def test_audio_glitch_from_a_busy_cpu_is_not(self):
+        # Reported: two "knocks" while the model was loading (CPU flat out).
+        # When the mic drops audio, the gap clicks; that must not count.
+        self.mic._glitch = True                 # what the audio callback sets on input overflow
+        self.frames(hit(peak=0.11))
+        self.assertEqual(self.knocks, [])
+        self.frames(*[quiet()] * int(L.KNOCK_GLITCH_SKIP * RATE / N + 2))
+        self.frames(hit(peak=0.2))              # a real hit afterwards still counts
+        self.assertEqual(len(self.knocks), 1)
+
+    def test_right_after_loopy_speaks_is_not(self):
+        # Reported: "knock!" just after Loopy finished talking (its voice's tail end).
+        # The mic is paused while Loopy talks...
+        self.mic.pause()
+        self.mic.feed(quiet())
+        self.mic.resume()                       # ...and comes back on
+        self.mic._vad = lambda frame: 0.0       # no voice model needed for this test
+        self.mic.feed(hit(peak=0.09))
+        self.assertEqual(self.knocks, [])
+        for _ in range(int(L.KNOCK_RESUME_SKIP * RATE / N + 2)):
+            self.mic.feed(quiet())
+        self.mic.feed(hit(peak=0.2))            # once settled, a real hit counts
         self.assertEqual(len(self.knocks), 1)
 
     def test_the_dying_away_part_of_a_hit_is_not_a_second_knock(self):
@@ -105,11 +140,12 @@ class KnockDetection(unittest.TestCase):
         self.assertEqual(self.knocks, [])
 
     def test_sensitivity_can_be_changed(self):
-        self.frames(hit(peak=0.01))
+        self.frames(hit(peak=0.02))
         self.assertEqual(self.knocks, [])
-        self.mic.knock_above_noise = 1.3        # very sensitive, e.g. from settings.json "knock_above_noise"
+        self.mic.knock_peak = 0.01              # more sensitive, from settings.json:
+        self.mic.knock_above_noise = 10.0       # "knock_peak" and "knock_above_noise"
         self.frames(*[quiet()] * int(L.KNOCK_COOLDOWN * RATE / N + 2))
-        self.frames(hit(peak=0.01))
+        self.frames(hit(peak=0.02))
         self.assertEqual(len(self.knocks), 1)
 
     def test_background_adapts_to_a_noisy_room(self):
