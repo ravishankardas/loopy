@@ -122,6 +122,8 @@ class Speaker:
         self._worker: threading.Thread | None = None
         self._current: SpeechStream | None = None
         self.underflows = 0  # times playback ran dry mid-utterance (audible gaps)
+        self._free = threading.Event()  # cleared by hold(): speech waits instead of playing
+        self._free.set()
 
     def set_model(self, model_path: Path) -> None:
         """Switch voices; the new one loads on the next utterance."""
@@ -159,6 +161,19 @@ class Speaker:
         s = SpeechStream(on_start, on_chunk, on_done)
         self._queue.put(s)
         return s
+
+    def hold(self) -> None:
+        """Keep quiet (e.g. while a sound clip plays): nothing new starts and
+        speech in progress pauses before its next piece. Nothing is lost:
+        it carries on after release()."""
+        self._free.clear()
+
+    def release(self) -> None:
+        self._free.set()
+
+    @property
+    def held(self) -> bool:
+        return not self._free.is_set()
 
     def stop(self) -> None:
         """Cut off what's playing and drop everything queued."""
@@ -212,6 +227,9 @@ class Speaker:
             first = True
             while (text := s.take(first)) is not None:
                 first = False
+                while not self._free.wait(0.05):   # held (a clip is playing): wait
+                    if self._stop.is_set() or s._cancelled:
+                        break
                 if self._stop.is_set():
                     break
                 if not started:

@@ -144,6 +144,34 @@ class AskBeforeActing(BrainTest):
         self.assertEqual(self.actions.ran, [])
         self.assertNotIn("closed", said)
 
+    def test_placeholder_tag_with_no_words_gets_a_second_try(self):
+        # Reported: "What can you do for me?" -> the model wrote only "[ask: ACTION]"
+        # and Loopy said nothing at all.
+        turn, said = self.turn("What can you do for me?", "[ask: ACTION]",
+                               "[none] I can chat, play tic-tac-toe and more!")
+        self.assertEqual(said, "I can chat, play tic-tac-toe and more!")
+        self.assertEqual(self.actions.ran, [])
+
+    def test_empty_reply_is_asked_for_again(self):
+        turn, said = self.turn("hello?", "[none]", "[ask: ACTION]", "[none] Hi there!")
+        self.assertEqual(said, "Hi there!")
+        self.assertEqual(len(self.brain._llm.calls), 3)  # asked twice more
+        self.assertIn("had no words", self.brain._llm.calls[1][-1]["content"])
+
+    def test_loopy_never_stays_silent(self):
+        # Empty every single time: only then the fallback line.
+        turn, said = self.turn("hello?", "[none]", "[ask: ACTION]", "[none]")
+        self.assertIn("Could you say that again?", said)
+
+    def test_a_reply_with_words_isnt_asked_for_again(self):
+        turn, said = self.turn("hello?", "[none] Hi!")
+        self.assertEqual(len(self.brain._llm.calls), 1)
+
+    def test_prompt_has_no_placeholders_to_copy(self):
+        prompt = brain._system_prompt()
+        for placeholder in ("[ask: ACTION]", "[do: ACTION]", "[check: FACT]", "[move: N]", "[play: N]"):
+            self.assertNotIn(placeholder, prompt)
+
     def test_history_records_what_really_happened(self):
         # After a blocked [do], the model must not "remember" doing it.
         self.turn("open chrome", "[do: open chrome] Okay, Chrome is open!")
@@ -171,6 +199,17 @@ class FactsAreLookedUpNotGuessed(BrainTest):
         turn, said = self.turn("what percentage?", "[check: system]", "[none] Still pretty busy.")
         self.assertIn("20%", said)
         self.assertIn("86%", said)
+
+    def test_empty_answer_after_a_lookup_is_never_silent(self):
+        # A fact without numbers (e.g. "no battery found" on a desktop) can't be
+        # rescued by the numbers safety net, so an empty answer must still speak.
+        with mock.patch.object(checks, "read", lambda name: "no battery found"):
+            turn, said = self.turn("how's my battery", "[check: battery]", "[none]", "[none]", "[none]")
+        self.assertIn("no battery found", said)
+
+    def test_empty_answer_after_a_lookup_is_asked_for_again(self):
+        turn, said = self.turn("what time is it", "[check: time]", "[none]", "[none] It's 9:40 PM.")
+        self.assertEqual(said, "It's 9:40 PM.")
 
     def test_precise_answer_isnt_repeated(self):
         turn, said = self.turn("how busy is my CPU", "[check: system]",

@@ -30,6 +30,22 @@ PREROLL_FRAMES = 15          # keep ~480 ms from before speech was detected
 MAX_SECONDS = 15
 MIN_SECONDS = 0.4
 
+# Knock detection: hitting the laptop makes a spike in the mic that is short
+# (a few ms), sharp and much louder than the room. Same idea as the first two
+# filters of github.com/NithinVarma50/spankurlaptop: check short blocks (a
+# 32 ms frame would dilute a 5 ms spike), compare with a rolling 2 s
+# background level, and require a spike shape rather than a steady sound.
+KNOCK_BLOCK = 128            # samples per block (8 ms at 16 kHz)
+# Mic levels differ a lot between laptops (noise suppression, mic volume): on
+# the laptop this was tuned on, real hits peaked at only 0.01-0.04 but were
+# 20-86x louder than the room. So "louder than the room" is the main test and
+# the absolute peak is just a floor above digital silence.
+KNOCK_ABOVE_NOISE = 15.0     # block must be this many times louder than the room
+KNOCK_SHARPNESS = 2.0        # peak / average level: a spike (steady sounds are ~1.4)
+KNOCK_PEAK = 0.005           # quietest peak that counts
+KNOCK_BACKGROUND_SECONDS = 2.0
+KNOCK_COOLDOWN = 2.0         # seconds; one hit triggers once
+
 
 class VoiceDetector:
     """Silero VAD, streaming: call with one 512-sample frame, get P(speech)."""
@@ -67,13 +83,24 @@ class Listener:
         on_utterance: Callable[[np.ndarray], None],
         on_speech_start: Callable[[], None] | None = None,
         on_level: Callable[[float], None] | None = None,
+        on_knock: Callable[[float], None] | None = None,
+        knock_peak: float = KNOCK_PEAK,
+        knock_above_noise: float = KNOCK_ABOVE_NOISE,
     ):
         """Callbacks run on the listener thread. `on_utterance` gets mono
         float32 audio at 16 kHz, or an empty array if the speech turned out
-        too short to be a command (so callers can undo on_speech_start)."""
+        too short to be a command (so callers can undo on_speech_start).
+        `on_knock` gets the peak level when someone hits the laptop."""
         self._on_utterance = on_utterance
         self._on_speech_start = on_speech_start
         self._on_level = on_level
+        self._on_knock = on_knock
+        self.knock_peak = knock_peak
+        self.knock_above_noise = knock_above_noise   # the main sensitivity knob
+        # Background: the room's level over the last 2 s (per 8 ms block).
+        self._background = collections.deque(maxlen=int(KNOCK_BACKGROUND_SECONDS * SAMPLE_RATE / KNOCK_BLOCK))
+        self._last_knock = -1e9
+        self._frames_seen = 0
         self._vad: VoiceDetector | None = None
         self._paused = threading.Event()
         self._frames: queue.Queue[np.ndarray | None] = queue.Queue()
@@ -138,6 +165,46 @@ class Listener:
         if self._vad is not None:
             self._vad.reset()
 
+    def knock_score(self, frame: np.ndarray) -> tuple[float, float, float]:
+        """For the most spiky 8 ms block of a frame: (peak, how many times
+        louder than the room's background, sharpness = peak / average)."""
+        best = (0.0, 0.0, 0.0)
+        background = self._background_level()
+        for block in frame.reshape(-1, KNOCK_BLOCK):
+            peak = float(np.max(np.abs(block)))
+            rms = float(np.sqrt(np.mean(block**2))) + 1e-9
+            score = (peak, rms / background, peak / rms)
+            if score[1] > best[1]:
+                best = score
+        return best
+
+    def _background_level(self) -> float:
+        if not self._background:
+            return 1e-3
+        return max(float(np.median(self._background)), 1e-4)  # median: a few loud blocks don't skew it
+
+    def _check_knock(self, frame: np.ndarray, speech_prob: float) -> None:
+        peak, above_noise, sharpness = self.knock_score(frame)
+        self._frames_seen += 1
+        now = self._frames_seen * FRAME / SAMPLE_RATE
+        learned = len(self._background) >= self._background.maxlen // 2   # ~1 s of room first
+        is_knock = (
+            learned
+            and peak >= self.knock_peak
+            and above_noise >= self.knock_above_noise
+            and sharpness >= KNOCK_SHARPNESS
+            and speech_prob < START_PROB           # a shout isn't a knock
+            and now - self._last_knock >= KNOCK_COOLDOWN
+        )
+        if is_knock:
+            self._last_knock = now
+            if self._on_knock:
+                self._on_knock(peak)
+        elif above_noise < self.knock_above_noise:
+            # Only ordinary blocks teach the background, never the spikes.
+            for block in frame.reshape(-1, KNOCK_BLOCK):
+                self._background.append(float(np.sqrt(np.mean(block**2))))
+
     def feed(self, frame: np.ndarray) -> None:
         """Process one 512-sample frame (public so tests can drive it)."""
         if self._paused.is_set():
@@ -146,6 +213,7 @@ class Listener:
             return
 
         prob = self._vad(frame)
+        self._check_knock(frame, prob)
 
         if not self._speaking:
             self._preroll.append(frame)

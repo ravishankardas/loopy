@@ -8,6 +8,7 @@ asks before doing anything on the computer. "Hey Loopy, how are you?" works
 in one go, asleep or awake. Falling asleep ends the conversation.
 """
 
+import os
 import signal
 import sys
 import threading
@@ -17,15 +18,37 @@ from PySide6.QtCore import QObject, QTimer, Signal
 from PySide6.QtWidgets import QApplication, QInputDialog, QMenu
 
 from loopy import models, settings, wake
+from loopy.game import BoardWindow
+from loopy.listener import KNOCK_ABOVE_NOISE, KNOCK_PEAK
 from loopy.mascot import Activity, Mascot, State
 from loopy.models import Voice
 
 DEFAULT_SLEEP_AFTER = 60  # seconds without activity before Loopy dozes off
+GAME_SLEEP_AFTER = 300    # ...longer during a game, so you have time to think
 
 
 def _log(text: str = "", end: str = "\n") -> None:
     """The conversation, printed in the terminal Loopy was started from."""
     print(text, end=end, flush=True)
+
+
+def _describe_game_event(event: tuple) -> str:
+    kind, *args = event
+    if kind == "start":
+        return "── tic-tac-toe started: " + ("Loopy goes first" if args[0] else "you go first") + " ──"
+    if kind == "place":
+        cell, mark = args
+        return f"[{'you' if mark == 'X' else 'Loopy'}: {mark} in {cell}]"
+    if kind == "illegal":
+        cell, why = args
+        return f"[Loopy tried {cell}: {why}, picking again]"
+    if kind == "over":
+        winner, _line, s = args
+        result = {"X": "you win", "O": "Loopy wins"}.get(winner, "draw")
+        return f"[game over: {result}. Score: you {s['you']}, Loopy {s['loopy']}, draws {s['draws']}]"
+    if kind == "stop":
+        return "── tic-tac-toe closed ──"
+    return ""  # thinking / your_turn: only shown on the board
 
 
 class Assistant(QObject):
@@ -42,7 +65,9 @@ class Assistant(QObject):
     _utterance = Signal(object)              # np.ndarray of audio
     _mic_level = Signal(float)               # 0..1 while talking
     _heard = Signal(str)                     # transcription result
-    _brain_ready = Signal()                  # model finished loading
+    _brain_ready = Signal(str)               # model finished loading ("" = ok, else the error)
+    _knock = Signal(float)                   # someone hit the laptop (peak level)
+    _game_event = Signal(object)             # tic-tac-toe event tuple, see brain.GameEvent
 
     def __init__(self, mascot: Mascot):
         super().__init__()
@@ -55,6 +80,7 @@ class Assistant(QObject):
         self._transcribing = False
         self._hearing = False                # someone is talking right now
         self._brain_loaded = False
+        self.brain_error = ""
         self._spoken = ""                    # what the bubble shows while talking
         self.speaker = None
         self.voice: Voice | None = settings.active_voice()
@@ -75,13 +101,20 @@ class Assistant(QObject):
         self._mic_level.connect(mascot.set_level)
         self._heard.connect(self._on_heard)
         self._brain_ready.connect(self._on_brain_ready)
+        self._game_event.connect(self._on_game_event)
+        self.board: BoardWindow | None = None
+        self._knock.connect(self._on_knock)
+        self._clip = None                    # created on the first knock
+        self._clip_playing = False
+        self._clip_id = 0
+        self._state_before_clip = State.IDLE
         mascot.speak_requested.connect(self.say)
         mascot.menu_extender = self._extend_menu
 
-        sleep_after = settings.load().get("sleep_after_seconds", DEFAULT_SLEEP_AFTER)
+        self._sleep_after = settings.load().get("sleep_after_seconds", DEFAULT_SLEEP_AFTER)
         self._sleep_timer = QTimer(self)
         self._sleep_timer.setSingleShot(True)
-        self._sleep_timer.setInterval(int(sleep_after * 1000))
+        self._sleep_timer.setInterval(int(self._sleep_after * 1000))
         self._sleep_timer.timeout.connect(self.go_to_sleep)
 
         # Brain: loading takes ~20 s, so start it now in the background.
@@ -92,10 +125,13 @@ class Assistant(QObject):
             self.brain = Brain(models.llm_path())
 
             def load_brain():
+                _log("Loading Loopy's brain (Llama 3.2 3B)...")
                 try:
                     self.brain.load()
-                finally:
-                    self._brain_ready.emit()
+                except Exception as exc:
+                    self._brain_ready.emit(repr(exc))
+                else:
+                    self._brain_ready.emit("")
 
             threading.Thread(target=load_brain, daemon=True).start()
 
@@ -113,6 +149,9 @@ class Assistant(QObject):
                 on_utterance=self._utterance.emit,
                 on_speech_start=self._speech_detected.emit,
                 on_level=self._mic_level.emit,
+                on_knock=self._knock.emit,
+                knock_peak=settings.load().get("knock_peak", KNOCK_PEAK),
+                knock_above_noise=settings.load().get("knock_above_noise", KNOCK_ABOVE_NOISE),
             )
             try:
                 self.listener.start()
@@ -132,8 +171,12 @@ class Assistant(QObject):
         every change of state; the order below is the priority."""
         m = self.mascot
         m.set_thinking(self._thinking and self._speaking)  # dots keep going while it talks
-        if self._downloading:
+        if self._clip_playing:
+            status = ("Ho yeah!", Activity.SPEAKING)
+        elif self._downloading:
             status = (f"Downloading {self._downloading.label.split(' (')[0]}'s voice...", Activity.BUSY)
+        elif self.brain_error:
+            status = ("Brain failed to load (see terminal)", Activity.IDLE)
         elif not self.ready:
             status = ("Setup needed: run 'loopy setup'", Activity.IDLE)
         elif self.listener is None:
@@ -155,13 +198,27 @@ class Assistant(QObject):
             status = ("Listening...", Activity.LISTENING)
         elif not self._brain_loaded:
             status = ("Getting ready...", Activity.BUSY)
+        elif self._game_on:
+            status = ("Tic-tac-toe · your turn", Activity.IDLE)
         else:
             status = ("Awake · just talk", Activity.IDLE)
         m.set_status(*status)
 
-    def _on_brain_ready(self) -> None:
+    def _on_brain_ready(self, error: str) -> None:
+        if error:
+            _log(f"       [brain failed to load: {error}]")
+            self.brain_error = error
+            self.mascot.show_bubble("My brain didn't load, sorry. The terminal says why.", 10000)
+            self._refresh_status()
+            return
         self._brain_loaded = True
+        _log("Loopy is ready.")
         self._refresh_status()
+        # Only now, with the model loaded, does Loopy say hello (unless you
+        # already asked something while it was loading: then it just answers).
+        if self.listener is not None and self.speaker and self.transcriber and not self._thinking:
+            self.say("Hi! I'm Loopy. Say hey Loopy whenever you want to chat.")
+        self._keep_awake()
 
     # -------------------------------------------------------- awake / asleep
 
@@ -186,7 +243,9 @@ class Assistant(QObject):
         if self.speaker:
             self.speaker.stop()
         if self.brain:
-            self.brain.reset()  # a new wake-up starts a new conversation
+            self.brain.reset()  # a new wake-up starts a new conversation (and ends any game)
+        if self.board:
+            self.board.hide()
         self.mascot.set_state(State.SLEEPING)
         self.mascot.show_bubble("", 0)
         self._refresh_status()
@@ -195,8 +254,15 @@ class Assistant(QObject):
         """Restart the sleep countdown. Called whenever Loopy goes back to
         idle; while it's listening, thinking or speaking the countdown is
         paused (see _busy), so it can't doze off mid-answer."""
+        if self.brain and not self._brain_loaded and not self.brain_error:
+            return  # still loading: don't count that as being idle
         if self.awake and not self._thinking and not self._speaking:
-            self._sleep_timer.start()
+            seconds = max(self._sleep_after, GAME_SLEEP_AFTER) if self._game_on else self._sleep_after
+            self._sleep_timer.start(int(seconds * 1000))
+
+    @property
+    def _game_on(self) -> bool:
+        return bool(self.brain and self.brain.game and not self.brain.game.over)
 
     def _busy(self) -> None:
         self._sleep_timer.stop()
@@ -281,24 +347,41 @@ class Assistant(QObject):
         speak = stream.feed if stream else self._thought.emit
         self._spoken = ""
 
+        line_open = [False]  # a "Loopy: ..." line is being printed
+
         def out(piece: str) -> None:  # to the voice and the terminal, as it's written
             speak(piece)
+            if not line_open[0]:
+                _log("Loopy: ", end="")
+                piece = piece.lstrip()
+                line_open[0] = True
             _log(piece, end="")
 
+        def end_line():
+            if line_open[0]:
+                _log()
+                line_open[0] = False
+
+        def on_event(*event):  # logged here, in order with the speech, then shown on the board
+            if description := _describe_game_event(event):
+                end_line()
+                _log(f"       {description}")
+            self._game_event.emit(event)
+
         def work():
-            _log("Loopy: ", end="")
             try:
-                turn = self.brain.respond(text, on_text=out)
+                turn = self.brain.respond(text, on_text=out, on_event=on_event)
                 if turn.result is not None and not turn.result.ok:
                     out(f" {turn.result.message}")  # e.g. "Chrome isn't open."
-                _log()
+                end_line()
                 for name, value in turn.checked:
                     _log(f"       [checked {name}: {value}]")
                 if turn.action:
                     _log(f"       [{'done' if turn.result.ok else 'failed'}: {turn.result.message}]")
             except Exception as exc:  # keep Loopy alive whatever happens
                 out(" Sorry, my brain got a bit tangled. Can you say that again?")
-                _log(f"\n       [brain error: {exc!r}]")
+                end_line()
+                _log(f"       [brain error: {exc!r}]")
                 turn = None
             finally:
                 if stream:
@@ -313,6 +396,43 @@ class Assistant(QObject):
             self.mascot.set_state(State.IDLE)
             self.mascot.show_bubble(self._spoken or (turn.reply if turn else ""), 2500)
         self._keep_awake()
+        self._refresh_status()
+
+    # ---------------------------------------------------------- tic-tac-toe
+
+    def _on_game_event(self, event: tuple) -> None:
+        kind, *args = event
+        if kind == "start":
+            (loopy_first,) = args
+            if self.board is None:
+                self.board = BoardWindow()
+            self.board.reset()
+            s = self.brain.scores
+            self.board.set_scores(s["you"], s["draws"], s["loopy"])
+            self.board.set_status("Loopy goes first..." if loopy_first else "Your turn · you're X")
+            self.board.open_next_to(self.mascot)
+        elif self.board is None:
+            return
+        elif kind == "place":
+            cell, mark = args
+            self.board.place(cell, mark)
+        elif kind == "thinking":
+            self.board.set_status("Loopy is thinking...")
+        elif kind == "illegal":
+            cell, _why = args
+            self.board.set_status(f"Loopy tried {cell or '?'}, nope! Rethinking...")
+        elif kind == "your_turn":
+            self.board.set_status("Your turn · say a number")
+        elif kind == "over":
+            winner, line, scores = args
+            if line:
+                self.board.show_win(line)
+            if winner in ("X", "O"):
+                QTimer.singleShot(450, lambda w=winner: self.board.celebrate(w))  # after the win line draws
+            self.board.set_scores(scores["you"], scores["draws"], scores["loopy"])
+            self.board.set_status({"X": "You win! \U0001F389", "O": "Loopy wins!"}.get(winner, "It's a draw!"))
+        elif kind == "stop":
+            self.board.hide()
         self._refresh_status()
 
     def _ask_by_typing(self) -> None:
@@ -391,12 +511,58 @@ class Assistant(QObject):
         self._refresh_status()
 
     def _resume_listening(self) -> None:
-        # Another sentence may have started in the last 300 ms; stay muted then.
-        if self.listener and not self._speaking:
+        # Another sentence (or the clip) may have started in the last 300 ms; stay muted then.
+        if self.listener and not self._speaking and not self._clip_playing:
             self.listener.resume()
+
+    # ------------------------------------------------------- knock knock
+
+    def _on_knock(self, peak: float) -> None:
+        """Someone hit the laptop: "Can I get a ho yeah!" """
+        if self._clip_playing:
+            return
+        from loopy.sounds import HO_YEAH, Clip
+
+        if self._clip is None:
+            self._clip = Clip(HO_YEAH)
+            self._clip.finished.connect(self._on_clip_finished)
+        _log(f"       [knock! (peak {peak:.2f}) -> can I get a ho yeah!]")
+        self._clip_playing = True
+        self._clip_id += 1
+        if self.speaker:
+            self.speaker.hold()    # Loopy's own voice waits until the clip is over
+            # Safety net if "finished" never comes; only for this clip, not a later one.
+            QTimer.singleShot(10_000, lambda clip=self._clip_id: clip == self._clip_id and self._release_voice())
+        if self.listener:
+            self.listener.pause()  # don't hear the clip as speech (or as more knocks)
+        self._state_before_clip = self.mascot.state()
+        self.mascot.set_state(State.SPEAKING)
+        self.mascot.show_bubble("Can I get a ho yeah?! \U0001F64C", 3800)
+        self._refresh_status()
+        self._clip.play()
+
+    def _release_voice(self) -> None:
+        if self.speaker:
+            self.speaker.release()
+
+    def _on_clip_finished(self) -> None:
+        self._clip_playing = False
+        self._release_voice()  # anything Loopy wanted to say now plays
+        QTimer.singleShot(300, self._resume_listening)
+        if self.mascot.state() == State.SPEAKING and not self._speaking:
+            if not self.awake:
+                self.mascot.set_state(State.SLEEPING)
+            elif self._thinking:
+                self.mascot.set_state(State.WORKING)
+            else:
+                self.mascot.set_state(State.IDLE)
+        self._refresh_status()
 
     def shutdown(self) -> None:
         self._sleep_timer.stop()
+        if self._clip:
+            self._clip.stop()
+        self._release_voice()
         if self.listener:
             self.listener.stop()
         if self.speaker:
@@ -487,6 +653,11 @@ def run() -> int:
     for s in (sys.stdout, sys.stderr):
         if hasattr(s, "reconfigure"):
             s.reconfigure(errors="replace")
+    # Sound clips: on Windows use its own media engine; Qt's default (FFmpeg)
+    # prints decoder chatter into the terminal, cluttering the conversation log.
+    if sys.platform == "win32":
+        os.environ.setdefault("QT_MEDIA_BACKEND", "windows")
+    os.environ.setdefault("QT_LOGGING_RULES", "qt.multimedia*=false")
     app = QApplication(sys.argv)
     mascot = Mascot()
     assistant = Assistant(mascot)
@@ -498,7 +669,7 @@ def run() -> int:
         mascot.show_bubble("I'm not fully set up yet. Run 'loopy setup' in a terminal.", 10000)
     elif assistant.listener is None:
         mascot.show_bubble(f"I can't open the microphone.\n({assistant.mic_error})", 10000)
-    else:
-        assistant.say("Hi! I'm Loopy. Say hey Loopy whenever you want to chat.")
+    # Otherwise Loopy stays quiet ("Getting ready...") until its brain has
+    # loaded, then says hello (see Assistant._on_brain_ready).
     assistant._keep_awake()
     return app.exec()

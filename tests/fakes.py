@@ -21,6 +21,9 @@ class FakeLlama:
 
         return chunks()
 
+    def tokenize(self, text: bytes, add_bos: bool = True, special: bool = False) -> list[int]:
+        return list(range(len(text.split())))  # roughly one token per word
+
 
 class RecordedActions:
     """Replaces actions.run so tests never touch the real Chrome."""

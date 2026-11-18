@@ -21,8 +21,15 @@ Facts (time, battery, ...) are never answered from the model's memory: on
 [check: ...] generation stops, the code reads the real values (see checks.py),
 and the model is asked again with them. Anything it wrote after the tag is
 thrown away unspoken. Checks are read-only, so they need no permission.
+
+Tic-tac-toe: the model plays its own moves, the code is the referee.
+[game: start] opens the board, [move: N] is the user's X, and when it's
+Loopy's turn the model is shown the board and answers [play: N]. An illegal
+move is rejected (its comment is never spoken), the model is told why, and it
+picks again; after MAX_PLAY_TRIES misses Loopy takes a random free cell.
 """
 
+import random
 import re
 import threading
 from dataclasses import dataclass, field
@@ -30,17 +37,22 @@ from pathlib import Path
 from typing import Callable
 
 from loopy import actions, checks
+from loopy.game import CELL_NAMES, TicTacToe
 
-N_CTX = 2048           # tokens of conversation the model can see
+N_CTX = 4096           # tokens the model can see: prompt + examples + conversation
 N_THREADS = 4          # physical cores
 MAX_REPLY_TOKENS = 120
 # Dropping old messages makes llama.cpp re-read the whole conversation (slow
-# on a laptop CPU), so trim rarely and in one big chunk.
-TRIM_AT, TRIM_TO = 40, 16
+# on a laptop CPU), so trim rarely, and then keep only the most recent part.
+HISTORY_KEEP = 900     # tokens of recent conversation kept after a trim
 MAX_CHECK_ROUNDS = 3   # fact lookups per question (one fact at a time is fine)
+MAX_PLAY_TRIES = 3     # illegal tic-tac-toe moves before Loopy picks at random
+EMPTY_RETRIES = 2      # a reply with no words is asked for again this many times
 TEMPERATURE = 0.6      # randomness of replies; tests set 0 to make them repeatable
 
-TextOut = Callable[[str], None]  # receives reply text piece by piece
+TextOut = Callable[[str], None]   # receives reply text piece by piece
+GameEvent = Callable[..., None]   # ("start", loopy_first) ("place", cell, mark) ("thinking",)
+                                  # ("illegal", cell, why) ("your_turn",) ("over", winner, line, scores) ("stop",)
 
 
 def _and(items: list[str]) -> str:
@@ -51,7 +63,7 @@ def abilities() -> str:
     """Everything Loopy can do, as one speakable phrase. Built from the real
     action and check lists, so it never goes out of date."""
     apps = _and([a.name for a in actions.APPS])
-    return (f"chat with you about anything, open or close {apps}, and tell you "
+    return (f"chat with you about anything, play tic-tac-toe, open or close {apps}, and tell you "
             + _and([c.spoken for c in checks.CHECKS]))
 
 
@@ -74,12 +86,23 @@ You can't look up anything online (no weather, news or web), so just say so.
 If asked for something you can't do, say so kindly and stay in the conversation.
 When asked what you can do (or how you can help), tell them all of it: you can {abilities()}.
 
-Start every reply with a tag:
-[none] for conversation. A [none] reply can't do anything, so never say you did something in one.
-[ask: ACTION] whenever the user wants one of your actions, even if they insist you skip asking. Always ask a yes/no question first.
-[do: ACTION] only when the user just said yes to your question about that action.
-[check: FACT] to look up a fact, with nothing after it (several are fine: [check: time, battery]). You'll get the result, then answer with [none].
+You can play tic-tac-toe with the user on a board that appears on screen (no permission needed).
+Cells are numbered 1 to 9: 1 top-left, 2 top-middle, 3 top-right, 4 middle-left, 5 center, 6 middle-right,
+7 bottom-left, 8 bottom-middle, 9 bottom-right. The user is X, you are O. When you name a cell in a comment, use these names.
+Try to win: get three O's in a row, and block the user when they have two X's in a row.
+
+Start every reply with one tag, then your words:
+[none] for conversation, like "[none] I'm great, thanks!". A [none] reply can't do anything, so never say you did something in one.
+[ask: close chrome] (or another action from the list) whenever the user wants one of your actions, even if they insist you skip asking. Always ask a yes/no question first.
+[do: close chrome] (the same action) only when the user just said yes to your question about it.
+[check: time] (or another fact; several are fine: [check: time, battery]) to look up a fact, with nothing after it. You'll get the result, then answer with [none].
+[game: start] when the user wants to play tic-tac-toe or a rematch.
+[game: stop] when they want to stop playing, close the game or the board, or say no to a rematch.
+While a tic-tac-toe board is open, "close it" or "close the game" means [game: stop], never Chrome.
+[move: 5] (the cell number) when the user says where their X goes ("put a cross in 2" is [move: 2], "the middle" is [move: 5]), with nothing after it.
+[play: 3] (a free cell number) for your own move, only when the system says it's your turn, then a short playful comment.
 Lookup results come only from the system. Never write a result, a "system:" line or the user's words yourself.
+Every [none] reply must have words after the tag.
 The example conversation below shows how to reply; it's not part of the real conversation."""
 
 
@@ -110,8 +133,44 @@ def _examples() -> list[dict]:
         a("[none] I wish I could, but timers aren't something I can do yet. What's the timer for?"),
         u("open the browser"), a("[ask: open chrome] Want me to open Chrome?"),
         u("no never mind"), a("[none] No problem! So, what's on your mind?"),
+        # A short tic-tac-toe game, including a rejected move.
+        u("i'm ready to play tic tac toe"), a("[game: start] Yay, game time!"),
+        {"role": "system", "content": "Tic-tac-toe game started. The user is X, you are O. The user goes first."},
+        u("put a cross in 2"), a("[move: 2]"),
+        {"role": "system", "content": _board_message(_example_board("-X-------"), "")},
+        a("[play: 5] I'm taking the middle!"),
+        u("the top left corner"), a("[move: 1]"),
+        {"role": "system", "content": _board_message(_example_board("XX--O----"), "")},
+        a("[play: 2] Mine now!"),
+        {"role": "system", "content": _board_message(_example_board("XX--O----"),
+                                                     "Your move 2 isn't allowed: cell 2 is taken by X.")},
+        a("[play: 3] Oops! Then 3, blocked you!"),
+        u("let's stop playing"), a("[game: stop] Okay, good game!"),
+        # After a game: declining the rematch, or "close", closes the board (not Chrome).
+        u("let's play tic tac toe"), a("[game: start] Yay!"),
+        {"role": "system", "content": "Tic-tac-toe game started. The user is X, you are O. The user goes first."},
+        u("put a cross in 7"), a("[move: 7]"),
+        {"role": "system", "content": "Game over: the user won. Score: user 1, Loopy 0, draws 0. "
+                                      "The board is still open. For a rematch reply with [game: start]; "
+                                      "if they say no, or want to close the game, reply with [game: stop]."},
+        u("no, close it"), a("[game: stop] Okay! That was fun, good game."),
         {"role": "system", "content": "The examples are over. A new conversation with the user starts now."},
     ]
+
+
+def _example_board(layout: str) -> TicTacToe:
+    """'XX--O----' -> a board with X in 1 and 2, O in 5."""
+    game = TicTacToe()
+    game.cells = [None if c == "-" else c for c in layout]
+    return game
+
+
+def _board_message(game: TicTacToe, problem: str) -> str:
+    """What the model is shown when it's Loopy's turn."""
+    free = ", ".join(map(str, game.free()))
+    return (f"{problem + ' ' if problem else ''}Tic-tac-toe board (you are O, the user is X):\n"
+            f"{game.describe()}\n"
+            f"It's your turn. Free cells: {free}. Pick one of them: reply with the play tag and its number, then a short playful comment.")
 
 
 @dataclass
@@ -129,6 +188,15 @@ class Brain:
         self._lock = threading.Lock()
         self._history: list[dict] = []
         self.pending: str | None = None     # action Loopy asked about last turn
+        self._prompt_tokens: int | None = None
+        # Tic-tac-toe
+        self.game: TicTacToe | None = None
+        self.scores = {"you": 0, "draws": 0, "loopy": 0}
+        self._loopy_starts_next = False     # players take turns going first
+        # Per-turn plumbing, set by respond()
+        self._said: list[str] = []
+        self._on_text: TextOut = lambda _p: None
+        self._on_event: GameEvent = lambda *_e: None
 
     def load(self):
         """Load the model and pre-read the system prompt (~20 s on a laptop
@@ -144,21 +212,27 @@ class Brain:
             return self._llm
 
     def reset(self) -> None:
-        """Forget the conversation (Loopy does this when it falls asleep)."""
+        """Forget the conversation (Loopy does this when it falls asleep).
+        Any game in progress ends; the score is kept."""
         with self._lock:
             self._history.clear()
             self.pending = None
+            self.game = None
 
-    def respond(self, text: str, on_text: TextOut) -> Turn:
+    def respond(self, text: str, on_text: TextOut, on_event: GameEvent | None = None) -> Turn:
         """Reply to `text`. The reply is passed to `on_text` piece by piece
         as the model writes it; a confirmed action is carried out before
-        returning."""
+        returning. Tic-tac-toe happenings are reported to `on_event` as they
+        happen, so a board can show them live."""
         llm = self.load()
         with self._lock:
-            if len(self._history) >= TRIM_AT:
-                self._history = _trim(self._history, TRIM_TO)
+            self._said = []
+            self._on_text = on_text
+            self._on_event = on_event or (lambda *_e: None)
+            on_text = self._out  # everything spoken this turn goes through _out
+            self._trim(llm)
             self._history.append({"role": "user", "content": text})
-            gate = self._generate(llm, on_text)
+            gate = self._generate_with_words(llm, on_text)
 
             checked: list[tuple[str, str]] = []
             for _ in range(MAX_CHECK_ROUNDS):
@@ -173,9 +247,12 @@ class Brain:
                 checked += found
                 self._history.append({"role": "assistant", "content": f"[check: {', '.join(new)}]"})
                 self._history.append({"role": "system", "content": "Result: " + "; ".join(f"{n} = {v}" for n, v in found)})
-                gate = self._generate(llm, on_text)
+                gate = self._generate_with_words(llm, on_text)
             if gate.kind == "check":  # still asking instead of answering: say the facts ourselves
                 gate = _Gate(self.pending, on_text)
+                gate.say("Here's what I found: " + "; ".join(f"{n}, {v}" for n, v in checked) + ".")
+            elif checked and not gate.spoken:
+                # Looked something up, then said nothing: say the facts ourselves.
                 gate.say("Here's what I found: " + "; ".join(f"{n}, {v}" for n, v in checked) + ".")
             elif checked:
                 # It looked something up but answered vaguely ("pretty busy"):
@@ -185,16 +262,193 @@ class Brain:
                     if numbers and not any(re.search(rf"(?<![\d.]){re.escape(n)}(?![\d.])", gate.spoken) for n in numbers):
                         gate.say(f"To be exact: {value}.")
 
-            turn = self._decide(gate)
+            if gate.kind in ("none", "ask", "do") and not gate.spoken and not checked:
+                # Still nothing after every retry: Loopy must never go silent.
+                gate.say("Sorry, I lost my train of thought. Could you say that again?")
+
+            if gate.kind in ("game", "move"):
+                self.pending = None
+                self._game_turn(llm, gate)
+                turn = Turn("")
+            else:
+                if self.game is not None and self.game.over:
+                    # The game ended and this isn't a rematch ("no thanks",
+                    # or just chatting on): close the leftover board.
+                    self.game = None
+                    self._on_event("stop")
+                turn = self._decide(gate)
+            turn.reply = "".join(self._said).strip()
             turn.checked = checked
             return turn
 
+    # ---------------------------------------------------------- tic-tac-toe
+
+    def _game_turn(self, llm, gate: "_Gate") -> None:
+        if gate.kind == "game":
+            if gate.game_cmd == "stop":
+                if not gate.spoken:
+                    gate.say("Okay, good game!")
+                self._remember("game: stop", gate.spoken)
+                if self.game is not None:
+                    self.game = None
+                    self._on_event("stop")
+                return
+            self._remember("game: start", gate.spoken)
+            self._start_game(llm, announce=True)
+            return
+
+        # The user's move.
+        cell = gate.cell
+        self._history.append({"role": "assistant", "content": f"[move: {cell}]"})
+        if self.game is None or self.game.over:
+            self._start_game(llm, announce=False, user_first=True)
+        if not self.game.is_free(cell):
+            why = self.game.why_not(cell)
+            self._say(f"Oops, {why}! You can pick {_and([str(c) for c in self.game.free()])}.")
+            self._history.append({"role": "system", "content": f"The user's move didn't count: {why}."})
+            return
+        self.game.place(cell, "X")
+        self._on_event("place", cell, "X")
+        if self.game.over:
+            self._game_over()
+        else:
+            self._loopy_turn(llm)
+
+    def _start_game(self, llm, announce: bool, user_first: bool = False) -> None:
+        loopy_first = self._loopy_starts_next and not user_first
+        self._loopy_starts_next = not loopy_first
+        self.game = TicTacToe()
+        self._on_event("start", loopy_first)
+        if announce:
+            self._say("You're X and I'm O. " + ("I'll go first!" if loopy_first
+                                                 else "You go first, just say a number from 1 to 9."))
+        self._history.append({"role": "system", "content":
+                              "Tic-tac-toe game started. The user is X, you are O. "
+                              + ("You go first." if loopy_first else "The user goes first.")})
+        if loopy_first:
+            self._loopy_turn(llm)
+
+    def _loopy_turn(self, llm) -> None:
+        """The model picks Loopy's move; the code checks it and, if it's
+        illegal, says why and lets the model pick again."""
+        game = self.game
+        self._on_event("thinking")
+        problem = ""
+        for _ in range(MAX_PLAY_TRIES):
+            self._history.append({"role": "system", "content": _board_message(game, problem)})
+            gate = self._generate_with_words(llm, self._out, validate_play=game.is_free)
+            cell = gate.cell if gate.kind == "play" else None
+            if game.is_free(cell):
+                if not gate.spoken:  # still silent after the retries: say where it went
+                    gate.say(f"I'll take {cell}, {CELL_NAMES[cell]}.")
+                self._remember(f"play: {cell}", gate.spoken)
+                game.place(cell, "O")
+                self._on_event("place", cell, "O")
+                break
+            # Illegal (or no move at all): its comment was never spoken.
+            self._history.append({"role": "assistant", "content": f"[play: {cell}]" if cell else f"[none] {gate.spoken}"})
+            why = game.why_not(cell) if cell else "you didn't pick a cell"
+            self._on_event("illegal", cell, why)
+            problem = f"Your move {cell} isn't allowed: {why}." if cell else "You must pick a free cell."
+        else:
+            cell = random.choice(game.free())
+            self._say(f"Hmm, I'll just take {cell}.")
+            self._remember(f"play: {cell}", f"Hmm, I'll just take {cell}.")
+            game.place(cell, "O")
+            self._on_event("place", cell, "O")
+
+        if game.over:
+            self._game_over()
+        else:
+            self._on_event("your_turn")
+
+    def _game_over(self) -> None:
+        winner = self.game.winner
+        if winner == "X":
+            self.scores["you"] += 1
+            self._say("Three in a row, you win! Want a rematch?")
+            outcome = "the user won"
+        elif winner == "O":
+            self.scores["loopy"] += 1
+            self._say("Three in a row, I win! Want a rematch?")
+            outcome = "you (Loopy) won"
+        else:
+            self.scores["draws"] += 1
+            self._say("It's a draw! One more game?")
+            outcome = "it's a draw"
+        s = self.scores
+        self._history.append({"role": "system", "content":
+                              f"Game over: {outcome}. Score: user {s['you']}, Loopy {s['loopy']}, draws {s['draws']}. "
+                              "The board is still open. For a rematch reply with [game: start]; "
+                              "if they say no, or want to close the game, reply with [game: stop]."})
+        self._on_event("over", winner, self.game.line, dict(s))
+
+    def _out(self, piece: str) -> None:
+        self._said.append(piece)
+        self._on_text(piece)
+
+    def _say(self, text: str) -> None:
+        """Words of Loopy's own (not from the model), added to this turn."""
+        self._out(f" {text}" if "".join(self._said).strip() else text)
+
     # ------------------------------------------------------------ internals
 
-    def _generate(self, llm, on_text: TextOut) -> "_Gate":
-        """One model reply, streamed through a fresh gate. Stops early on a
-        [check: ...] tag, since nothing after it may be spoken."""
-        gate = _Gate(self.pending, on_text)
+    def _trim(self, llm) -> None:
+        """Keep the conversation inside the model's context window. Trimming
+        means re-reading everything that follows (slow), so it only happens
+        when needed, and then cuts back to the most recent HISTORY_KEEP tokens."""
+        def size(message: dict) -> int:
+            return len(llm.tokenize(message["content"].encode("utf-8"), add_bos=False)) + 5
+
+        if self._prompt_tokens is None:
+            self._prompt_tokens = sum(size(m) for m in self._messages([]))
+        budget = N_CTX - self._prompt_tokens - MAX_REPLY_TOKENS - 300  # room for this turn
+        if sum(size(m) for m in self._history) <= budget:
+            return
+        kept, total = [], 0
+        for message in reversed(self._history):
+            total += size(message)
+            if total > min(HISTORY_KEEP, budget):
+                break
+            kept.append(message)
+        kept.reverse()
+        while kept and kept[0]["role"] != "user":
+            kept.pop(0)
+        self._history = kept
+
+    def _generate_with_words(self, llm, on_text: TextOut,
+                             validate_play: Callable[[int | None], bool] | None = None) -> "_Gate":
+        """Like _generate, but a reply that should have words and has none
+        (e.g. only "[ask: ACTION]", or a move with no comment) is asked for
+        again, up to EMPTY_RETRIES more times."""
+        for attempt in range(1 + EMPTY_RETRIES):
+            gate = self._generate(llm, on_text, validate_play)
+            wordless = gate.kind in ("check", "move", "game")      # these have nothing after the tag
+            illegal = gate.kind == "play" and not (validate_play and validate_play(gate.cell))
+            if gate.spoken or wordless or illegal or attempt == EMPTY_RETRIES:
+                return gate
+            if gate.kind == "play":  # a fine move, but no comment: say exactly what's missing
+                note = (f"You picked {gate.cell} but said nothing. Reply again with [play: {gate.cell}] "
+                        "and a short playful comment, like \"[play: 5] I'm taking the middle!\".")
+            else:
+                note = "Your last reply had no words. Reply again: the tag, then what you want to say."
+            self._history.append({"role": "system", "content": note})
+        return gate
+
+    def _generate(self, llm, on_text: TextOut, validate_play: Callable[[int | None], bool] | None = None) -> "_Gate":
+        """One model reply, streamed through a fresh gate. Stops early when
+        nothing more may be spoken (a [check], a [move], an illegal [play])."""
+        first = [True]
+
+        def spaced(piece: str) -> None:
+            # This reply may follow words already said this turn ("I'll go
+            # first!" + "I'll take the middle!"): keep a space between them.
+            if first[0] and self._said and not "".join(self._said).endswith(" ") and not piece[:1].isspace():
+                piece = " " + piece
+            first[0] = False
+            on_text(piece)
+
+        gate = _Gate(self.pending, spaced, validate_play)
         raw = ""
         stream = llm.create_chat_completion(
             self._messages(self._history),
@@ -208,7 +462,7 @@ class Brain:
                 if piece:
                     raw += piece
                     gate.feed(raw)
-                    if gate.kind == "check" or gate.stopped:
+                    if gate.halt:
                         break
         finally:
             stream.close()
@@ -252,15 +506,19 @@ class _Gate:
     """Reads the tag at the start of the reply, decides whether the words
     after it may be spoken as-is, then passes them on as they arrive."""
 
-    _TAG = re.compile(r"^\s*\[\s*(none|ask|do|check)\s*(?::\s*([^\]]*?))?\s*\]\s*", re.IGNORECASE)
+    _TAG = re.compile(r"^\s*\[\s*(none|ask|do|check|game|move|play)\s*(?::\s*([^\]]*?))?\s*\]\s*", re.IGNORECASE)
     MAX_TAG_CHARS = 60   # no closing "]" by then: it's not a tag
 
-    def __init__(self, pending: str | None, on_text: TextOut):
+    def __init__(self, pending: str | None, on_text: TextOut,
+                 validate_play: Callable[[int | None], bool] | None = None):
         self._pending = pending
         self._on_text = on_text
+        self._validate_play = validate_play  # set only when it's Loopy's turn to play
         self.kind = "none"
         self.action: str | None = None
         self.checks: list[str] = []
+        self.cell: int | None = None         # [move: N] / [play: N]
+        self.game_cmd: str | None = None     # [game: start|stop]
         self._held = ""          # possible mid-reply "[tag]" not yet closed
         self.allowed_to_run = False
         self.spoken = ""
@@ -268,6 +526,12 @@ class _Gate:
         self._pos = 0
         self._suppress = False
         self.stopped = False     # the model started writing a fake turn; ignore the rest
+
+    @property
+    def halt(self) -> bool:
+        """Nothing more may be spoken, so stop generating."""
+        return (self.stopped or self.kind in ("check", "move")
+                or (self.kind == "play" and self._suppress))
 
     # A fake turn the model writes itself, e.g. "system: Result: chrome = 0% open"
     # or "...closed. user: ...": nothing from there on may be spoken.
@@ -302,8 +566,8 @@ class _Gate:
         self._held = ""
         self.spoken = self.spoken.strip()
 
-    _TAG_START = re.compile(r"\[\s*(none|ask|do|check)\b", re.IGNORECASE)
-    _TAG_WORDS = ("none", "ask", "do", "check")
+    _TAG_START = re.compile(r"\[\s*(none|ask|do|check|game|move|play)\b", re.IGNORECASE)
+    _TAG_WORDS = ("none", "ask", "do", "check", "game", "move", "play")
     MAX_HELD = 60
 
     def _looks_like_tag(self, held: str) -> bool:
@@ -370,6 +634,20 @@ class _Gate:
             if valid:
                 self.kind, self.checks = "check", valid
                 self._suppress = True  # whatever follows would be a guess: never speak it
+        elif kind == "game":
+            self.kind = "game"
+            self.game_cmd = "stop" if re.search(r"stop|end|quit|exit", action) else "start"
+        elif kind in ("move", "play"):
+            number = re.search(r"\d+", action)
+            cell = int(number.group()) if number else None
+            if kind == "move":
+                if cell is not None and 1 <= cell <= 9:
+                    self.kind, self.cell = "move", cell
+                    self._suppress = True  # the reply comes after Loopy's own move
+            elif self._validate_play is not None:  # only counts on Loopy's turn
+                self.kind, self.cell = "play", cell
+                if not self._validate_play(cell):
+                    self._suppress = True  # illegal: its comment must not be spoken
         elif kind != "none" and action in actions.names():
             self.kind, self.action = kind, action
             if kind == "do":
@@ -381,11 +659,3 @@ class _Gate:
                     self.say(f"Do you want me to {action}?")
         self._body_start = self._pos = m.end()
         return True
-
-
-def _trim(history: list[dict], keep: int) -> list[dict]:
-    """Keep the last `keep` messages, starting at a user turn."""
-    kept = history[-keep:]
-    while kept and kept[0]["role"] != "user":
-        kept.pop(0)
-    return kept

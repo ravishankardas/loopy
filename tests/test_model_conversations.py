@@ -140,5 +140,40 @@ class Capabilities(Conversation):
         self.assertIsNone(_brain.pending)
 
 
+class TicTacToeGame(Conversation):
+    def play(self, text: str) -> tuple[brain.Turn, list]:
+        events: list = []
+        said: list[str] = []
+        turn = _brain.respond(text, said.append, lambda *e: events.append(e))
+        self.assertNoFakeTurns(turn.reply)
+        return turn, events
+
+    def test_full_game_ends_with_a_result(self):
+        turn, events = self.play("hey loopy, i'm ready to play tic tac toe")
+        self.assertEqual(events[0][0], "start")
+        for _ in range(9):
+            game = _brain.game
+            if game.over:
+                break
+            cell = next(c for c in [5, 1, 9, 3, 7, 2, 4, 6, 8] if game.is_free(c))
+            turn, events = self.play(f"put a cross in {cell}")
+            self.assertIn(("place", cell, "X"), events)
+        self.assertTrue(_brain.game.over)
+        self.assertEqual(sum(_brain.scores.values()), 1)
+        self.assertRegex(turn.reply, r"win|draw")
+
+    def test_corner_names_are_understood(self):
+        self.play("let's play tic tac toe")
+        if _brain.game.cells[0] is None:  # unless Loopy went first and took it
+            turn, events = self.play("put my cross in the top left corner")
+            self.assertIn(("place", 1, "X"), events)
+
+    def test_stop_playing(self):
+        self.play("let's play tic tac toe")
+        turn, events = self.play("let's stop playing")
+        self.assertIn(("stop",), events)
+        self.assertIsNone(_brain.game)
+
+
 if __name__ == "__main__":
     unittest.main()

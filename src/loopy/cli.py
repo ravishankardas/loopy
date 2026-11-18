@@ -7,6 +7,7 @@
     loopy say TEXT            speak a line, to test the voice
     loopy chat                talk to Loopy by typing (same brain, no mic needed)
     loopy hear                test the microphone, wake word and speech recognition
+    loopy knock-test          hit the laptop and see whether Loopy notices
 """
 
 import argparse
@@ -27,6 +28,7 @@ def main(argv: list[str] | None = None) -> int:
     chat = sub.add_parser("chat", help="talk to Loopy by typing (no mic needed)")
     chat.add_argument("--speak", action="store_true", help="also speak Loopy's replies aloud")
     sub.add_parser("hear", help="test the microphone: prints what Loopy hears, live")
+    sub.add_parser("knock-test", help="hit your laptop and see if Loopy notices (for tuning knock_peak)")
     args = parser.parse_args(argv)
 
     if args.command == "setup":
@@ -39,6 +41,8 @@ def main(argv: list[str] | None = None) -> int:
         return _chat(args.speak)
     if args.command == "hear":
         return _hear()
+    if args.command == "knock-test":
+        return _knock_test()
 
     from loopy.app import run
 
@@ -122,7 +126,16 @@ def _chat(speak: bool) -> int:
                 if stream:
                     stream.feed(piece)
 
-            turn = brain.respond(text, on_text)
+            def on_event(kind, *args) -> None:  # tic-tac-toe: show the board as text
+                if kind == "place":
+                    cell, mark = args
+                    who = "you" if mark == "X" else "Loopy"
+                    board = "\n".join(f"        {row}" for row in brain.game.describe().splitlines())
+                    print(f"\n  [{who}: {mark} in {cell}]\n{board}\n", end="loopy> ", flush=True)
+                elif kind == "illegal":
+                    print(f"\n  [Loopy tried {args[0]}: {args[1]}, picking again]", end="\nloopy> ", flush=True)
+
+            turn = brain.respond(text, on_text, on_event)
             if turn.result and not turn.result.ok:
                 on_text(f" {turn.result.message}")
             if stream:
@@ -175,6 +188,92 @@ def _hear() -> int:
         print("\nStopped.")
     finally:
         listener.stop()
+    return 0
+
+
+def _knock_test() -> int:
+    import os
+    import signal
+
+    if sys.platform == "win32":
+        os.environ.setdefault("QT_MEDIA_BACKEND", "windows")  # no decoder chatter in the output
+    from PySide6.QtCore import QCoreApplication, QObject, QTimer, Signal
+
+    from loopy import listener as L
+    from loopy import settings
+    from loopy.sounds import HO_YEAH, Clip
+
+    app = QCoreApplication([])
+    clip = Clip(HO_YEAH)
+
+    class Bridge(QObject):  # knocks are detected on the mic thread; the clip plays on Qt's
+        knocked = Signal()
+
+    bridge = Bridge()
+
+    s = settings.load()
+    peak_needed = s.get("knock_peak", L.KNOCK_PEAK)
+    above_needed = s.get("knock_above_noise", L.KNOCK_ABOVE_NOISE)
+    knocks = []
+
+    def on_knock(peak: float) -> None:
+        knocks.append(peak)
+        bridge.knocked.emit()
+
+    mic = L.Listener(on_utterance=lambda _a: None, on_knock=on_knock,
+                     knock_peak=peak_needed, knock_above_noise=above_needed)
+
+    def play() -> None:
+        if clip.play():
+            mic.pause()  # so the clip itself isn't heard as another knock
+
+    bridge.knocked.connect(play)
+    clip.finished.connect(lambda: QTimer.singleShot(300, mic.resume))
+    original = mic._check_knock
+    sound = {"best": None, "knock": False, "quiet": 0, "learning": False}  # the sound being heard now
+
+    def report(frame, speech_prob):  # one line per sound: its strongest moment, and whether it counted
+        before = len(knocks)
+        peak, above, sharp = mic.knock_score(frame)
+        learning = len(mic._background) < mic._background.maxlen // 2
+        original(frame, speech_prob)
+        if above >= 4:
+            if sound["best"] is None or above > sound["best"][1]:
+                sound["best"] = (peak, above, sharp, speech_prob)
+            sound["learning"] |= learning
+            sound["knock"] |= len(knocks) > before
+            sound["quiet"] = 0
+        elif sound["best"] is not None:
+            sound["quiet"] += 1
+            if sound["quiet"] >= 4:  # ~130 ms of calm: that sound is over
+                p, a, sh, sp = sound["best"]
+                why = [] if sound["knock"] else [w for w, bad in [
+                    ("not loud enough vs the room", a < above_needed), ("peak too low", p < peak_needed),
+                    ("not sharp", sh < L.KNOCK_SHARPNESS), ("sounded like speech", sp >= L.START_PROB)] if bad]
+                if not why:
+                    why = ["still learning the room, first second"] if sound["learning"] else ["cooldown: just after another knock"]
+                verdict = "KNOCK! -> ho yeah" if sound["knock"] else f"not a knock ({', '.join(why)})"
+                print(f"  {a:6.1f}x louder than the room (need {above_needed:g})   peak {p:.3f} (need {peak_needed:g})"
+                      f"   sharpness {sh:.1f} (need {L.KNOCK_SHARPNESS:g})   speech {sp:.2f}   {verdict}", flush=True)
+                sound.update(best=None, knock=False, quiet=0, learning=False)
+
+    mic._check_knock = report
+    mic.start()
+    print("Hit or tap your laptop a few times, then also talk, type and clap. One line per sound;")
+    print("every knock plays the clip, like Loopy does. Ctrl+C to stop.")
+    print('Sensitivity is "knock_above_noise" in settings.json: lower it if hits are missed,')
+    print("raise it if typing or talking counts as a knock.\n")
+
+    signal.signal(signal.SIGINT, lambda *_: app.quit())  # Ctrl+C while Qt's loop runs
+    wake = QTimer()
+    wake.timeout.connect(lambda: None)  # lets Python notice Ctrl+C
+    wake.start(200)
+    try:
+        app.exec()
+    finally:
+        clip.stop()
+        mic.stop()
+    print(f"\nStopped. {len(knocks)} knock(s) detected.")
     return 0
 
 
