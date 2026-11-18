@@ -149,6 +149,21 @@ loopy setup
 loopy
 ```
 
+### Tests
+
+```bash
+python -m unittest discover tests        # fast tests, under a second, no model needed
+```
+
+The fast tests use a fake model that replies with scripted, misbehaving output. They check that Loopy's code still asks before every action, never speaks tags or invented "system:" lines, reports real numbers, and that checks stay read-only.
+
+To also replay real conversations against Llama 3.2 3B (a few minutes, needs `loopy setup`):
+
+```bash
+set LOOPY_MODEL_TESTS=1                  # PowerShell: $env:LOOPY_MODEL_TESTS=1
+python -m unittest discover tests -v
+```
+
 ## Credits
 
 Loopy is built on these open-source projects and models. Each has its own license:

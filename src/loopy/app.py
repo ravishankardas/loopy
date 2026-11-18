@@ -292,6 +292,8 @@ class Assistant(QObject):
                 if turn.result is not None and not turn.result.ok:
                     out(f" {turn.result.message}")  # e.g. "Chrome isn't open."
                 _log()
+                for name, value in turn.checked:
+                    _log(f"       [checked {name}: {value}]")
                 if turn.action:
                     _log(f"       [{'done' if turn.result.ok else 'failed'}: {turn.result.message}]")
             except Exception as exc:  # keep Loopy alive whatever happens

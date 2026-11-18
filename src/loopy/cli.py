@@ -128,6 +128,8 @@ def _chat(speak: bool) -> int:
             if stream:
                 stream.close()
             print()
+            for name, value in turn.checked:
+                print(f"  [checked {name}: {value}]")
             if turn.result:
                 print(f"  [{'done' if turn.result.ok else 'failed'}: {turn.result.message}]")
     except (KeyboardInterrupt, EOFError):
