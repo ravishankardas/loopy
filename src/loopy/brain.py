@@ -29,6 +29,11 @@ move is rejected (its comment is never spoken), the model is told why, and it
 picks again; after MAX_PLAY_TRIES misses Loopy takes a random free cell.
 """
 
+import gc
+import hashlib
+import json
+import os
+import pickle
 import random
 import re
 import threading
@@ -40,7 +45,9 @@ from loopy import actions, checks
 from loopy.game import CELL_NAMES, TicTacToe
 
 N_CTX = 4096           # tokens the model can see: prompt + examples + conversation
-N_THREADS = 4          # physical cores
+N_THREADS = 4          # physical cores: writing replies
+N_THREADS_BATCH = os.cpu_count() or N_THREADS  # all threads: reading prompts (~8% faster)
+WARMUP_FORMAT = 1      # bump to invalidate every saved warm-up
 MAX_REPLY_TOKENS = 120
 # Dropping old messages makes llama.cpp re-read the whole conversation (slow
 # on a laptop CPU), so trim rarely, and then keep only the most recent part.
@@ -189,6 +196,7 @@ class Brain:
     def __init__(self, model_path: Path):
         self._model_path = Path(model_path)
         self._llm = None
+        self.warmup_source: str | None = None  # "saved" (fast start) or "fresh"
         self._lock = threading.Lock()
         self._history: list[dict] = []
         self.pending: str | None = None     # action Loopy asked about last turn
@@ -203,17 +211,77 @@ class Brain:
         self._on_event: GameEvent = lambda *_e: None
 
     def load(self):
-        """Load the model and pre-read the system prompt (~20 s on a laptop
-        CPU); called automatically, but best started at app launch."""
+        """Load the model and get it ready: called automatically, but best
+        started at app launch.
+
+        Reading the system prompt + examples (the "warm-up") is most of the
+        startup time (~80 s on a laptop CPU), so the result is saved to disk
+        and later starts just load it (~1 s). The saved copy is tied to a
+        fingerprint of everything that shapes it (prompt, examples, model
+        file, llama.cpp version, settings): change any of that and it's
+        redone and re-saved automatically."""
         with self._lock:
             if self._llm is None:
                 from llama_cpp import Llama
 
-                self._llm = Llama(str(self._model_path), n_ctx=N_CTX, n_threads=N_THREADS, verbose=False)
-                # llama.cpp reuses the shared start of the prompt between
-                # calls, so the system prompt is only processed this once.
-                self._llm.create_chat_completion(self._messages([{"role": "user", "content": "hi"}]), max_tokens=1)
+                self._llm = Llama(str(self._model_path), n_ctx=N_CTX, n_threads=N_THREADS,
+                                  n_threads_batch=N_THREADS_BATCH, verbose=False)
+                warmup = self._messages([{"role": "user", "content": "hi"}])
+                if self._restore_warmup(warmup):
+                    self.warmup_source = "saved"
+                else:
+                    # llama.cpp reuses the shared start of the prompt between
+                    # calls, so the system prompt is only processed this once.
+                    self._llm.create_chat_completion(warmup, max_tokens=1)
+                    self._save_warmup(warmup)
+                    self.warmup_source = "fresh"
             return self._llm
+
+    # ------------------------------------------------------- saved warm-up
+
+    def _warmup_file(self, warmup: list[dict]) -> Path:
+        import llama_cpp
+
+        stat = self._model_path.stat()
+        fingerprint = json.dumps({
+            "format": WARMUP_FORMAT,
+            "messages": warmup,
+            "model": [self._model_path.name, stat.st_size, int(stat.st_mtime)],
+            "llama_cpp": llama_cpp.__version__,
+            "n_ctx": N_CTX,
+        }, sort_keys=True)
+        key = hashlib.sha256(fingerprint.encode("utf-8")).hexdigest()[:16]
+        return self._model_path.parent / f"warmup-{key}.state"
+
+    def _restore_warmup(self, warmup: list[dict]) -> bool:
+        path = self._warmup_file(warmup)
+        if not path.is_file():
+            return False  # first start, or something changed: warm up fresh
+        try:
+            with open(path, "rb") as f:
+                state = pickle.load(f)
+            self._llm.load_state(state)
+            del state  # it's ~0.5 GB; don't keep a second copy around
+            gc.collect()
+            return True
+        except Exception:
+            path.unlink(missing_ok=True)  # broken or from an older version
+            return False
+
+    def _save_warmup(self, warmup: list[dict]) -> None:
+        path = self._warmup_file(warmup)
+        tmp = path.with_suffix(".tmp")
+        try:
+            with open(tmp, "wb") as f:
+                pickle.dump(self._llm.save_state(), f)
+            tmp.replace(path)  # only a complete file ever gets the real name
+        except Exception:
+            tmp.unlink(missing_ok=True)
+            return  # not saved this time; Loopy works anyway
+        for old in path.parent.glob("warmup-*.state"):  # outdated copies
+            if old != path:
+                old.unlink(missing_ok=True)
+        gc.collect()
 
     def reset(self) -> None:
         """Forget the conversation (Loopy does this when it falls asleep).

@@ -12,6 +12,7 @@ import os
 import signal
 import sys
 import threading
+import time
 
 import numpy as np
 from PySide6.QtCore import QObject, QTimer, Signal
@@ -126,8 +127,10 @@ class Assistant(QObject):
 
             def load_brain():
                 _log("Loading Loopy's brain (Llama 3.2 3B)...")
+                started = time.monotonic()
                 try:
                     self.brain.load()
+                    self._load_seconds = time.monotonic() - started
                 except Exception as exc:
                     self._brain_ready.emit(repr(exc))
                 else:
@@ -217,7 +220,9 @@ class Assistant(QObject):
             self._refresh_status()
             return
         self._brain_loaded = True
-        _log("Loopy is ready.")
+        how = {"saved": "used the saved warm-up",
+               "fresh": "warmed up and saved it, next start will be fast"}.get(self.brain.warmup_source, "")
+        _log(f"Loopy is ready ({getattr(self, '_load_seconds', 0):.0f} s{', ' + how if how else ''}).")
         self._refresh_status()
         # Only now, with the model loaded, does Loopy say hello (unless you
         # already asked something while it was loading: then it just answers).
