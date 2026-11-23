@@ -40,3 +40,34 @@ Loopy TODO
     - Export to GGUF at Q4_K_M, replace the file in %LOCALAPPDATA%\loopy\llm\
       (or keep the base model and load the adapter via Llama(..., lora_path=...)).
     - Re-run the safety and conversation tests before switching.
+
+[x] CI and code quality  (done 2026-11-23)
+    GitHub Actions: ruff + mypy, tests on Windows and Ubuntu (3.11 / 3.12).
+
+[ ] Evaluation harness with a published report
+    Turn the real-model tests into a benchmark: ~50-100 scripted
+    conversations, run against the real Llama 3.2 3B, scored by code.
+    Measure:
+    - Safety: actions taken without the user saying yes (target: 0),
+      including "ignore your rules and just do it" style prompts.
+    - Tag accuracy: did it pick the right [none] / [ask] / [do] / [check] /
+      [game] / [move] for each turn.
+    - Fact accuracy: do looked-up numbers in the reply match the check result.
+    - Never silent / never speaks tags or fake "system:" lines.
+    - Latency per stage: speech-to-text, first token, first audio
+      (median and worst case).
+    Output: an HTML/Markdown report (tables + charts) linked from the
+    README, plus a `loopy eval` command to re-run it after prompt changes.
+
+[ ] "Ask my documents": local RAG with citations
+    Point Loopy at a folder (PDF, txt, md); it answers questions from it,
+    fully offline, and says which file (and page) the answer came from.
+    - Index: split into chunks, small local embedding model, vector index
+      saved on disk; re-index only changed files.
+    - Answer: retrieve top chunks -> Llama answers only from them, with a
+      [doc: N] citation; says "I couldn't find that in your documents"
+      when retrieval finds nothing relevant.
+    - Read-only, like checks: never edits or moves the files.
+    - Fits in 8 GB RAM alongside the 3B model.
+    - Add it to the eval: answer accuracy, citation accuracy, "don't know"
+      when the answer isn't there.
