@@ -17,6 +17,7 @@ from enum import Enum
 from PySide6.QtCore import QPoint, QPointF, QRect, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import (
     QAction,
+    QGuiApplication,
     QColor,
     QCursor,
     QFont,
@@ -27,6 +28,16 @@ from PySide6.QtGui import (
     QPen,
 )
 from PySide6.QtWidgets import QApplication, QMenu, QWidget
+
+
+def system_drag(widget: QWidget) -> bool:
+    """On Wayland, apps can't move their own windows (Loopy just wouldn't
+    budge), so hand the drag to the compositor. Returns True if it did; then
+    the window moves on its own and partners can't follow. Elsewhere (Windows,
+    macOS, X11/XWayland) Loopy moves itself, partners and all."""
+    if QGuiApplication.platformName() == "wayland" and widget.windowHandle() is not None:
+        return widget.windowHandle().startSystemMove()
+    return False
 
 
 def move_together(lead: QWidget, top_left: QPoint, partners: list[QWidget] = ()) -> None:
@@ -457,6 +468,8 @@ class Mascot(QWidget):
 
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
+            if system_drag(self):  # Wayland: the compositor moves the window
+                return
             self._drag_offset = (
                 event.globalPosition().toPoint() - self.frameGeometry().topLeft()
             )

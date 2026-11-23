@@ -782,6 +782,27 @@ def _quit_on_ctrl_c(app: QApplication) -> QTimer:
     return wake_timer  # caller must keep a reference
 
 
+def pick_display_backend(environ=os.environ, platform: str = sys.platform,
+                         find_library=None) -> str | None:
+    """On a Linux Wayland desktop (Ubuntu's default), apps can't move their
+    own windows, so Loopy couldn't be dragged. Run through XWayland instead,
+    where they can: dragging, games moving with Loopy and staying on top all
+    work like on Windows. Qt's X11 backend needs libxcb-cursor, so only switch
+    when it's there. Returns a hint to show if it isn't."""
+    if not platform.startswith("linux") or "QT_QPA_PLATFORM" in environ:
+        return None  # not Linux, or the user chose a backend themselves
+    if not environ.get("WAYLAND_DISPLAY") and environ.get("XDG_SESSION_TYPE") != "wayland":
+        return None  # plain X11: windows can be moved already
+    if find_library is None:
+        import ctypes.util
+        find_library = ctypes.util.find_library
+    if find_library("xcb-cursor"):
+        environ["QT_QPA_PLATFORM"] = "xcb"  # XWayland
+        return None
+    return ("Running on Wayland: you can drag Loopy, but the game windows can't move with it. "
+            "For the full experience: sudo apt install libxcb-cursor0")
+
+
 def run(start_with_game: str | None = None) -> int:
     """Start Loopy. With start_with_game ("tic-tac-toe" or "snake", from
     `loopy tic-tac-toe` / `loopy snake`), it jumps straight into that game
@@ -796,6 +817,8 @@ def run(start_with_game: str | None = None) -> int:
     if sys.platform == "win32":
         os.environ.setdefault("QT_MEDIA_BACKEND", "windows")
     os.environ.setdefault("QT_LOGGING_RULES", "qt.multimedia*=false")
+    if hint := pick_display_backend():
+        _log(f"[note] {hint}")
     app = QApplication(sys.argv)
     mascot = Mascot()
     assistant = Assistant(mascot)

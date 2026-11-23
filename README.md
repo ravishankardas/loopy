@@ -21,6 +21,16 @@ No cloud and no API keys. Speech recognition, the language model and the voice a
 - A microphone and speakers
 - Tested on Windows 11. The macOS and Linux code paths exist but are untested.
 
+### Ubuntu / Linux
+
+Ubuntu's default Wayland desktop doesn't let apps move their own windows, so Loopy runs itself through XWayland there. That needs one system library:
+
+```bash
+sudo apt install libxcb-cursor0
+```
+
+Without it Loopy still starts on Wayland, and you can still drag it, but the game windows can't move along with it.
+
 ## Install
 
 ```bash

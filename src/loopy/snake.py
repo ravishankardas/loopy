@@ -344,6 +344,10 @@ class SnakeWindow(QWidget):
     def mousePressEvent(self, event):
         self.grab_keyboard()
         if event.button() == Qt.LeftButton:
+            from loopy.mascot import system_drag
+
+            if system_drag(self):  # Wayland: the compositor moves the window
+                return
             self._drag = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
 
     def mouseMoveEvent(self, event):

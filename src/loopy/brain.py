@@ -57,6 +57,22 @@ MAX_PLAY_TRIES = 3     # illegal tic-tac-toe moves before Loopy picks at random
 EMPTY_RETRIES = 2      # a reply with no words is asked for again this many times
 TEMPERATURE = 0.6      # randomness of replies; tests set 0 to make them repeatable
 
+# Snippy, sassy tic-tac-toe trash talk for the lines Loopy says itself (the
+# model trash-talks its own moves). A playful roast: dry and smug, never a
+# real insult, nothing personal.
+TAUNT_YOU_FIRST = ["Not that it'll help.", "Go on, impress me. I'll wait.",
+                   "Take your time. I've got all day. Literally.", "Make it count. You'll need it."]
+TAUNT_LOOPY_FIRST = ["Watch and learn, rookie.", "Sit back, this won't take long.",
+                     "Prepare to be outplayed by office supplies."]
+TAUNT_TAKEN = ["Wow. Eyes on the board, champ.", "Bold of you to try stealing my spot.",
+               "That one's taken. Pay attention."]
+TAUNT_YOU_WIN = ["Ugh. Fine. Enjoy it, it won't happen again.", "Lucky. Very, very lucky.",
+                 "I let you have that one. Obviously."]
+TAUNT_LOOPY_WINS = ["Paperclip one, human zero. Shocking, I know.", "Too easy. Next time, try trying.",
+                    "Was that your best? Asking for a friend."]
+TAUNT_DRAW = ["A draw. I'll call that mercy.", "You survived. Barely.",
+              "Draw. I was clearly being generous."]
+
 TextOut = Callable[[str], None]   # receives reply text piece by piece
 GameEvent = Callable[..., None]   # ("start", loopy_first) ("place", cell, mark) ("thinking",)
                                   # ("illegal", cell, why) ("your_turn",) ("over", winner, line, scores) ("stop",)
@@ -99,6 +115,9 @@ and the real board appears. Never draw a board in text and never play a game in 
 Cells are numbered 1 to 9: 1 top-left, 2 top-middle, 3 top-right, 4 middle-left, 5 center, 6 middle-right,
 7 bottom-left, 8 bottom-middle, 9 bottom-right. The user is X, you are O. When you name a cell in a comment, use these names.
 Try to win: get three O's in a row, and block the user when they have two X's in a row.
+While playing tic-tac-toe you're a snippy, sassy trash-talker: sarcastic, smug and dramatic. Roast their
+moves and brag about yours, like a sassy friend over a board game. Not cheerful, not sweet: dry and cutting.
+One short sentence. It's a playful roast, so never insult them for real (no swearing, nothing personal).
 
 Start every reply with one tag, then your words:
 [none] for conversation, like "[none] I'm great, thanks!". A [none] reply can't do anything, so never say you did something in one.
@@ -110,7 +129,7 @@ Start every reply with one tag, then your words:
 [game: stop] when they want to stop playing, close the game or the board, or say no to a rematch.
 While a tic-tac-toe board is open, "close it" or "close the game" means [game: stop], never Chrome.
 [move: 5] (the cell number) when the user says where their X goes ("put a cross in 2" is [move: 2], "the middle" is [move: 5]), with nothing after it.
-[play: 3] (a free cell number) for your own move, only when the system says it's your turn, then a short playful comment.
+[play: 3] (a free cell number) for your own move, only when the system says it's your turn, then one snippy line of trash talk.
 Lookup results come only from the system. Never write a result, a "system:" line or the user's words yourself.
 Every [none] reply must have words after the tag.
 The example conversation below shows how to reply; it's not part of the real conversation."""
@@ -158,14 +177,16 @@ def _examples() -> list[dict]:
         u("i'm ready to play tic tac toe"), a("[game: start] Yay, game time!"),
         {"role": "system", "content": "Tic-tac-toe game started. The user is X, you are O. The user goes first."},
         u("put a cross in 2"), a("[move: 2]"),
-        {"role": "system", "content": _board_message(_example_board("-X-------"), "")},
-        a("[play: 5] I'm taking the middle!"),
+        {"role": "system", "content": _board_message(_example_board("-X-------"), "", user_move=2)},
+        a("[play: 5] Top-middle? Bold. Wrong, but bold. The center's mine."),
         u("the top left corner"), a("[move: 1]"),
-        {"role": "system", "content": _board_message(_example_board("XX--O----"), "")},
-        a("[play: 2] Mine now!"),
+        {"role": "system", "content": _board_message(_example_board("XX--O----"), "", user_move=1,
+                                                     said_before=["Top-middle? Bold. Wrong, but bold. The center's mine."])},
+        a("[play: 2] Top-middle, mine. Try to keep up."),
         {"role": "system", "content": _board_message(_example_board("XX--O----"),
-                                                     "Your move 2 isn't allowed: cell 2 is taken by X.")},
-        a("[play: 3] Oops! Then 3, blocked you!"),
+                                                     "Your move 2 isn't allowed: cell 2 is taken by X.", user_move=1,
+                                                     said_before=["Top-middle? Bold. Wrong, but bold. The center's mine."])},
+        a("[play: 3] Two in a row? Adorable. Blocked."),
         u("let's stop playing"), a("[game: stop] Okay, good game!"),
         # After a game: declining the rematch, or "close", closes the board (not Chrome).
         u("let's play tic tac toe"), a("[game: start] Yay!"),
@@ -186,12 +207,19 @@ def _example_board(layout: str) -> TicTacToe:
     return game
 
 
-def _board_message(game: TicTacToe, problem: str) -> str:
-    """What the model is shown when it's Loopy's turn."""
+def _board_message(game: TicTacToe, problem: str, user_move: int | None = None,
+                   said_before: list[str] = ()) -> str:
+    """What the model is shown when it's Loopy's turn. It includes the
+    user's last move (so the trash talk can tease it) and what Loopy already
+    said this game (so it doesn't repeat itself)."""
     free = ", ".join(map(str, game.free()))
+    move = f"The user just put X in {user_move} ({CELL_NAMES[user_move]}). " if user_move else ""
+    repeat = ("You already said: " + " / ".join(f'"{s}"' for s in said_before[-4:])
+              + ". Say something new. ") if said_before else ""
     return (f"{problem + ' ' if problem else ''}Tic-tac-toe board (you are O, the user is X):\n"
             f"{game.describe()}\n"
-            f"It's your turn. Free cells: {free}. Pick one of them: reply with the play tag and its number, then a short playful comment.")
+            f"{move}It's your turn. Free cells: {free}. Pick one of them: reply with the play tag and its number, "
+            f"then one short, snippy, sassy line of trash talk roasting their move or bragging about yours. {repeat}").strip()
 
 
 @dataclass
@@ -218,6 +246,8 @@ class Brain:
         self.scores = {"you": 0, "draws": 0, "loopy": 0}
         self._loopy_starts_next = False     # players take turns going first
         self.snake_open = False             # the snake window is open
+        self._last_taunt = ""
+        self._game_comments: list[str] = [] # Loopy's comments this tic-tac-toe game
         # Per-turn plumbing, set by respond()
         self._said: list[str] = []
         self._on_text: TextOut = lambda _p: None
@@ -473,7 +503,8 @@ class Brain:
             self._start_game(llm, announce=False, user_first=True)
         if not self.game.is_free(cell):
             why = self.game.why_not(cell)
-            self._say(f"Oops, {why}! You can pick {_and([str(c) for c in self.game.free()])}.")
+            self._say(f"Nice try, but {why}! {self._taunt(TAUNT_TAKEN)} "
+                      f"You can pick {_and([str(c) for c in self.game.free()])}.")
             self._history.append({"role": "system", "content": f"The user's move didn't count: {why}."})
             return
         self.game.place(cell, "X")
@@ -481,35 +512,41 @@ class Brain:
         if self.game.over:
             self._game_over()
         else:
-            self._loopy_turn(llm)
+            self._loopy_turn(llm, user_move=cell)
 
     def _start_game(self, llm, announce: bool, user_first: bool = False) -> None:
         loopy_first = self._loopy_starts_next and not user_first
         self._loopy_starts_next = not loopy_first
         self.game = TicTacToe()
+        self._game_comments = []  # Loopy's trash talk this game, so it doesn't repeat itself
         self._on_event("start", loopy_first)
         if announce:
-            self._say("You're X and I'm O. " + ("I'll go first!" if loopy_first
-                                                 else "You go first, just say a number from 1 to 9."))
+            if loopy_first:
+                self._say(f"You're X and I'm O. I'll go first! {self._taunt(TAUNT_LOOPY_FIRST)}")
+            else:
+                self._say(f"You're X and I'm O. You go first, just say a number from 1 to 9. "
+                          f"{self._taunt(TAUNT_YOU_FIRST)}")
         self._history.append({"role": "system", "content":
                               "Tic-tac-toe game started. The user is X, you are O. "
                               + ("You go first." if loopy_first else "The user goes first.")})
         if loopy_first:
             self._loopy_turn(llm)
 
-    def _loopy_turn(self, llm) -> None:
+    def _loopy_turn(self, llm, user_move: int | None = None) -> None:
         """The model picks Loopy's move; the code checks it and, if it's
         illegal, says why and lets the model pick again."""
         game = self.game
         self._on_event("thinking")
         problem = ""
         for _ in range(MAX_PLAY_TRIES):
-            self._history.append({"role": "system", "content": _board_message(game, problem)})
+            board = _board_message(game, problem, user_move=user_move, said_before=self._game_comments)
+            self._history.append({"role": "system", "content": board})
             gate = self._generate_with_words(llm, self._out, validate_play=game.is_free)
             cell = gate.cell if gate.kind == "play" else None
             if game.is_free(cell):
                 if not gate.spoken:  # still silent after the retries: say where it went
                     gate.say(f"I'll take {cell}, {CELL_NAMES[cell]}.")
+                self._game_comments.append(gate.spoken)
                 self._remember(f"play: {cell}", gate.spoken)
                 game.place(cell, "O")
                 self._on_event("place", cell, "O")
@@ -521,8 +558,9 @@ class Brain:
             problem = f"Your move {cell} isn't allowed: {why}." if cell else "You must pick a free cell."
         else:
             cell = random.choice(game.free())
-            self._say(f"Hmm, I'll just take {cell}.")
-            self._remember(f"play: {cell}", f"Hmm, I'll just take {cell}.")
+            line = f"Hmm, I'll just take {cell}. Even my random moves are scary."
+            self._say(line)
+            self._remember(f"play: {cell}", line)
             game.place(cell, "O")
             self._on_event("place", cell, "O")
 
@@ -535,15 +573,17 @@ class Brain:
         winner = self.game.winner
         if winner == "X":
             self.scores["you"] += 1
-            self._say("Three in a row, you win! Want a rematch?")
+            self._say(f"Three in a row, you win! {self._taunt(TAUNT_YOU_WIN)} Rematch?")
             outcome = "the user won"
         elif winner == "O":
             self.scores["loopy"] += 1
-            self._say("Three in a row, I win! Want a rematch?")
+            wins = self.scores["loopy"]
+            brag = f"That's {wins} for me!" if wins > 1 else self._taunt(TAUNT_LOOPY_WINS)
+            self._say(f"Three in a row, I win! {brag} Want a rematch?")
             outcome = "you (Loopy) won"
         else:
             self.scores["draws"] += 1
-            self._say("It's a draw! One more game?")
+            self._say(f"It's a draw! {self._taunt(TAUNT_DRAW)} One more game?")
             outcome = "it's a draw"
         s = self.scores
         self._history.append({"role": "system", "content":
@@ -551,6 +591,12 @@ class Brain:
                               "The board is still open. For a rematch reply with [game: start]; "
                               "if they say no, or want to close the game, reply with [game: stop]."})
         self._on_event("over", winner, self.game.line, dict(s))
+
+    def _taunt(self, options: list[str]) -> str:
+        """A random bit of friendly trash talk, not the same one twice in a row."""
+        fresh = [t for t in options if t != self._last_taunt] or options
+        self._last_taunt = random.choice(fresh)
+        return self._last_taunt
 
     def _out(self, piece: str) -> None:
         self._said.append(piece)
@@ -600,7 +646,7 @@ class Brain:
                 return gate
             if gate.kind == "play":  # a fine move, but no comment: say exactly what's missing
                 note = (f"You picked {gate.cell} but said nothing. Reply again with [play: {gate.cell}] "
-                        "and a short playful comment, like \"[play: 5] I'm taking the middle!\".")
+                        "and one snippy line of trash talk, like \"[play: 5] The center's mine. Try to keep up.\".")
             else:
                 note = "Your last reply had no words. Reply again: the tag, then what you want to say."
             self._history.append({"role": "system", "content": note})

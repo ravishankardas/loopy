@@ -114,7 +114,9 @@ class StartingAndStopping(GameTest):
         self.turn("2", "[move: 2]", "[play: 5] b")
         self.turn("3", "[move: 3]")
         said, _ = self.start("[play: 5] I'll place my O in the middle!")
-        self.assertIn("I'll go first! I'll place my O", said)
+        self.assertIn("I'll go first!", said)
+        self.assertRegex(said, r"[.!] I'll place my O")   # a space before the model's words...
+        self.assertNotRegex(said, r"[.!]I'll")             # ...never glued on
 
     def test_a_board_drawn_in_text_starts_the_real_game(self):
         # Reported: "Play that TikTok toe game" -> the model played in words:
@@ -154,6 +156,66 @@ class StartingAndStopping(GameTest):
         self.brain.reset()
         self.assertIsNone(self.brain.game)
         self.assertEqual(self.brain.scores["you"], 1)
+
+
+class TrashTalk(GameTest):
+    """Requested: friendly trash talk while playing tic-tac-toe."""
+
+    def test_the_model_is_asked_to_trash_talk(self):
+        prompt = brain._system_prompt()
+        self.assertIn("trash-talker", prompt)
+        self.assertIn("never insult them for real", prompt)
+        self.assertIn("trash talk", brain._board_message(TicTacToe(), ""))
+
+    def test_loopys_own_lines_trash_talk(self):
+        said, _ = self.start()
+        self.assertTrue(any(t in said for t in brain.TAUNT_YOU_FIRST))
+
+    def test_the_same_taunt_isnt_used_twice_in_a_row(self):
+        picks = [self.brain._taunt(brain.TAUNT_DRAW) for _ in range(30)]
+        self.assertTrue(all(a != b for a, b in zip(picks, picks[1:])))
+
+    def test_the_model_sees_the_users_last_move(self):
+        # So it can tease it ("Top-middle? Cute.") instead of only talking about itself.
+        self.start()
+        self.turn("put a cross in 2", "[move: 2]", "[play: 5] Cute.")
+        board_msg = self.last_system_message(call=1)
+        self.assertIn("The user just put X in 2 (top-middle)", board_msg)
+
+    def test_the_model_is_told_what_it_already_said(self):
+        # Seen with the real model: "Corner move, gotta keep it tight!" four times.
+        self.start()
+        self.turn("5", "[move: 5]", "[play: 1] Corner move, gotta keep it tight!")
+        self.turn("9", "[move: 9]", "[play: 3] Something else!")
+        board_msg = self.last_system_message(call=1)
+        self.assertIn('You already said: "Corner move, gotta keep it tight!"', board_msg)
+        self.assertIn("Say something new", board_msg)
+
+    def test_a_new_game_starts_with_a_clean_slate(self):
+        self.start()
+        self.turn("5", "[move: 5]", "[play: 1] Old line!")
+        self.turn("let's stop", "[game: stop] Bye!")
+        self.brain._loopy_starts_next = False   # you go first again (it would be Loopy's turn)
+        self.start()
+        self.turn("5", "[move: 5]", "[play: 1] New line!")
+        self.assertNotIn("Old line", self.last_system_message(call=1))
+
+    def test_loopy_keeps_count_when_it_keeps_winning(self):
+        self.brain.scores["loopy"] = 2
+        self.start()
+        self.turn("1", "[move: 1]", "[play: 4] a")
+        self.turn("2", "[move: 2]", "[play: 5] b")
+        said, _ = self.turn("9", "[move: 9]", "[play: 6] Got you!")
+        self.assertIn("That's 3 for me!", said)
+
+    def test_taunts_are_sassy_but_never_real_insults(self):
+        everything = " ".join(brain.TAUNT_YOU_FIRST + brain.TAUNT_LOOPY_FIRST + brain.TAUNT_TAKEN
+                              + brain.TAUNT_YOU_WIN + brain.TAUNT_LOOPY_WINS + brain.TAUNT_DRAW).lower()
+        for word in ("stupid", "idiot", "dumb", "loser", "suck", "pathetic", "hate", "ugly", "fat"):
+            self.assertNotIn(word, everything)
+        prompt = brain._system_prompt()
+        self.assertIn("snippy, sassy", prompt)       # requested: snippy, not cheerful
+        self.assertIn("Not cheerful", prompt)
 
 
 class StartingWithoutAsking(GameTest):
