@@ -104,6 +104,33 @@ class SavedWarmup(unittest.TestCase):
         b2, model2 = self.start()                     # and it's fixed for next time
         self.assertEqual(model2.warmups, 0)
 
+    def test_rebuild_redoes_it_even_when_up_to_date(self):
+        # `loopy rebuild`: warm up fresh and save, ignoring the saved copy.
+        self.start()
+        b = Brain(self.model)
+        b.load(fresh=True)
+        model = FakeModel.instances[-1]
+        self.assertEqual(model.warmups, 1)
+        self.assertIsNone(model.restored)
+        self.assertEqual(len(self.saved_files()), 1)
+        self.assertEqual(b.warmup_path.name, self.saved_files()[0])
+        b2, model2 = self.start()                      # and the next start is fast
+        self.assertEqual(model2.warmups, 0)
+
+    def test_loopy_rebuild_command(self):
+        from loopy import cli, models
+        with mock.patch.object(models, "llm_path", lambda: self.model), \
+             mock.patch.object(models, "llm_installed", lambda: True):
+            self.assertEqual(cli.main(["rebuild"]), 0)
+        self.assertEqual(len(self.saved_files()), 1)
+
+    def test_loopy_rebuild_reports_a_failed_save(self):
+        from loopy import cli, models
+        with mock.patch.object(models, "llm_path", lambda: self.model), \
+             mock.patch.object(models, "llm_installed", lambda: True), \
+             mock.patch.object(FakeModel, "save_state", side_effect=MemoryError):
+            self.assertEqual(cli.main(["rebuild"]), 1)
+
     def test_failing_to_save_doesnt_break_loading(self):
         with mock.patch.object(FakeModel, "save_state", side_effect=MemoryError):
             b, model = self.start()

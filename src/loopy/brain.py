@@ -70,7 +70,7 @@ def abilities() -> str:
     """Everything Loopy can do, as one speakable phrase. Built from the real
     action and check lists, so it never goes out of date."""
     apps = _and([a.name for a in actions.APPS])
-    return (f"chat with you about anything, play tic-tac-toe, open or close {apps}, and tell you "
+    return (f"chat with you about anything, play tic-tac-toe or snake, open or close {apps}, and tell you "
             + _and([c.spoken for c in checks.CHECKS]))
 
 
@@ -106,6 +106,7 @@ Start every reply with one tag, then your words:
 [do: close chrome] (the same action) only when the user just said yes to your question about it.
 [check: time] (or another fact; several are fine: [check: time, battery]) to look up a fact, with nothing after it. You'll get the result, then answer with [none].
 [game: start] when the user wants to play tic-tac-toe or a rematch.
+[game: snake] when the user wants to play snake. They play it alone with the arrow keys; you cheer them on.
 [game: stop] when they want to stop playing, close the game or the board, or say no to a rematch.
 While a tic-tac-toe board is open, "close it" or "close the game" means [game: stop], never Chrome.
 [move: 5] (the cell number) when the user says where their X goes ("put a cross in 2" is [move: 2], "the middle" is [move: 5]), with nothing after it.
@@ -144,6 +145,15 @@ def _examples() -> list[dict]:
         u("no never mind"), a("[none] No problem! So, what's on your mind?"),
         u("play that tiktok toe game"), a("[game: start] Ooh, tic-tac-toe! Let's go!"),
         u("let's stop playing"), a("[game: stop] Okay, good game!"),
+        u("can we play snake"), a("[game: snake] Ooh, snake! Show me what you've got!"),
+        a(f"[none] {Brain.SNAKE_STILL_PLAYING}"),
+        {"role": "system", "content": "The snake game is paused: the user stopped steering. If they want to keep "
+                                      "playing, reply with [game: snake]. If not, reply with [game: stop]."},
+        u("yeah"), a("[game: snake] Yay, back to it!"),
+        a(f"[none] {Brain.SNAKE_STILL_PLAYING}"),
+        {"role": "system", "content": "The snake game is paused: the user stopped steering. If they want to keep "
+                                      "playing, reply with [game: snake]. If not, reply with [game: stop]."},
+        u("no, I'm done"), a("[game: stop] Okay, good game!"),
         # A short tic-tac-toe game, including a rejected move.
         u("i'm ready to play tic tac toe"), a("[game: start] Yay, game time!"),
         {"role": "system", "content": "Tic-tac-toe game started. The user is X, you are O. The user goes first."},
@@ -197,6 +207,8 @@ class Brain:
         self._model_path = Path(model_path)
         self._llm = None
         self.warmup_source: str | None = None  # "saved" (fast start) or "fresh"
+        self.warmup_path: Path | None = None   # the saved warm-up file, once written
+        self.warmup_error: str | None = None   # why saving it failed, if it did
         self._lock = threading.Lock()
         self._history: list[dict] = []
         self.pending: str | None = None     # action Loopy asked about last turn
@@ -205,14 +217,16 @@ class Brain:
         self.game: TicTacToe | None = None
         self.scores = {"you": 0, "draws": 0, "loopy": 0}
         self._loopy_starts_next = False     # players take turns going first
+        self.snake_open = False             # the snake window is open
         # Per-turn plumbing, set by respond()
         self._said: list[str] = []
         self._on_text: TextOut = lambda _p: None
         self._on_event: GameEvent = lambda *_e: None
 
-    def load(self):
+    def load(self, fresh: bool = False):
         """Load the model and get it ready: called automatically, but best
-        started at app launch.
+        started at app launch. fresh=True ignores any saved warm-up and
+        redoes it (`loopy rebuild`).
 
         Reading the system prompt + examples (the "warm-up") is most of the
         startup time (~80 s on a laptop CPU), so the result is saved to disk
@@ -227,7 +241,7 @@ class Brain:
                 self._llm = Llama(str(self._model_path), n_ctx=N_CTX, n_threads=N_THREADS,
                                   n_threads_batch=N_THREADS_BATCH, verbose=False)
                 warmup = self._messages([{"role": "user", "content": "hi"}])
-                if self._restore_warmup(warmup):
+                if not fresh and self._restore_warmup(warmup):
                     self.warmup_source = "saved"
                 else:
                     # llama.cpp reuses the shared start of the prompt between
@@ -275,8 +289,10 @@ class Brain:
             with open(tmp, "wb") as f:
                 pickle.dump(self._llm.save_state(), f)
             tmp.replace(path)  # only a complete file ever gets the real name
-        except Exception:
+            self.warmup_path = path
+        except Exception as exc:
             tmp.unlink(missing_ok=True)
+            self.warmup_error = repr(exc)
             return  # not saved this time; Loopy works anyway
         for old in path.parent.glob("warmup-*.state"):  # outdated copies
             if old != path:
@@ -290,6 +306,7 @@ class Brain:
             self._history.clear()
             self.pending = None
             self.game = None
+            self.snake_open = False
 
     def respond(self, text: str, on_text: TextOut, on_event: GameEvent | None = None) -> Turn:
         """Reply to `text`. The reply is passed to `on_text` piece by piece
@@ -362,9 +379,9 @@ class Brain:
 
     # ---------------------------------------------------------- tic-tac-toe
 
-    def new_game(self, on_text: TextOut, on_event: GameEvent | None = None) -> Turn:
-        """Start a tic-tac-toe game without being asked in words (the
-        `loopy tic-tac-toe` command, or the right-click menu)."""
+    def new_game(self, on_text: TextOut, on_event: GameEvent | None = None, kind: str = "tic-tac-toe") -> Turn:
+        """Start a game without being asked in words (`loopy tic-tac-toe`,
+        `loopy snake`, or the right-click menu). kind: "tic-tac-toe" or "snake"."""
         llm = self.load()
         with self._lock:
             self._said = []
@@ -372,12 +389,62 @@ class Brain:
             self._on_event = on_event or (lambda *_e: None)
             self._trim(llm)
             self.pending = None
-            # Recorded as if asked, so the model knows why a board is open.
-            self._history.append({"role": "user", "content": "Let's play tic-tac-toe!"})
-            self._say("Yay, let's play!")
-            self._remember("game: start", "Yay, let's play!")
-            self._start_game(llm, announce=True)
+            # Recorded as if asked, so the model knows why a game is open.
+            if kind == "snake":
+                self._history.append({"role": "user", "content": "Let's play snake!"})
+                self._say("Ooh, snake!")
+                self._remember("game: snake", "Ooh, snake!")
+                self._start_snake()
+            else:
+                self._history.append({"role": "user", "content": "Let's play tic-tac-toe!"})
+                self._say("Yay, let's play!")
+                self._remember("game: start", "Yay, let's play!")
+                self._close_snake()
+                self._start_game(llm, announce=True)
             return Turn("".join(self._said).strip())
+
+    # ------------------------------------------------------------- snake
+    # The user plays snake alone with the keyboard (see snake.py); the brain
+    # only opens/closes it and remembers how it went, so Loopy can cheer.
+
+    SNAKE_STILL_PLAYING = "Hey, are you still playing? Say yes to keep going, or no and I'll close the game."
+
+    def snake_idle(self) -> str:
+        """The snake game paused itself (nobody steering). Returns what
+        Loopy asks; tells the model how to read the answer."""
+        with self._lock:
+            self._history.append({"role": "assistant", "content": f"[none] {self.SNAKE_STILL_PLAYING}"})
+            self._history.append({"role": "system", "content":
+                                  "The snake game is paused: the user stopped steering. If they want to keep "
+                                  "playing, reply with [game: snake]. If not, reply with [game: stop]."})
+        return self.SNAKE_STILL_PLAYING
+
+    def _start_snake(self) -> None:
+        if self.snake_open:  # already open (e.g. "yes, keep playing"): carry on, don't restart
+            self._on_event("snake_resume")
+            already_said = "".join(self._said).strip()  # e.g. the model's "Yay, back to it!"
+            self._say(("" if already_said else "Okay, back to it! ") + "Press an arrow key when you're ready.")
+            self._history.append({"role": "system", "content": "The user is playing snake again."})
+            return
+        if self.game is not None:  # one game at a time
+            self.game = None
+            self._on_event("stop")
+        self.snake_open = True
+        self._on_event("snake_start")
+        self._say("Steer with the arrow keys, and don't bite your own tail!")
+        self._history.append({"role": "system", "content":
+                              "Snake game opened. The user plays alone with the arrow keys; you cheer them on."})
+
+    def _close_snake(self) -> None:
+        if self.snake_open:
+            self.snake_open = False
+            self._on_event("snake_stop")
+
+    def note(self, text: str) -> None:
+        """Tell the model something that happened outside the conversation,
+        e.g. "The user's snake game ended with a score of 12"."""
+        with self._lock:
+            self._history.append({"role": "system", "content": text})
 
     def _game_turn(self, llm, gate: "_Gate") -> None:
         if gate.kind == "game":
@@ -388,8 +455,14 @@ class Brain:
                 if self.game is not None:
                     self.game = None
                     self._on_event("stop")
+                self._close_snake()
+                return
+            if gate.game_cmd == "snake":
+                self._remember("game: snake", gate.spoken)
+                self._start_snake()
                 return
             self._remember("game: start", gate.spoken)
+            self._close_snake()
             self._start_game(llm, announce=True)
             return
 
@@ -756,7 +829,8 @@ class _Gate:
                 self._suppress = True  # whatever follows would be a guess: never speak it
         elif kind == "game":
             self.kind = "game"
-            self.game_cmd = "stop" if re.search(r"stop|end|quit|exit", action) else "start"
+            self.game_cmd = ("stop" if re.search(r"stop|end|quit|exit|close", action)
+                             else "snake" if "snake" in action else "start")
         elif kind in ("move", "play"):
             number = re.search(r"\d+", action)
             cell = int(number.group()) if number else None

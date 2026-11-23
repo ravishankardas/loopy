@@ -2,7 +2,9 @@
 
     loopy                     start the assistant
     loopy tic-tac-toe         start the assistant straight into a game of tic-tac-toe
+    loopy snake               start the assistant straight into a game of snake
     loopy setup               download the models (run once after pip install)
+    loopy rebuild             redo the saved warm-up now (after a prompt change), so starts are fast
     loopy setup --voice ID    download a specific voice
     loopy voices              list available voices
     loopy say TEXT            speak a line, to test the voice
@@ -20,9 +22,11 @@ def main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="command")
     sub.add_parser("run", help="start Loopy (the default)")
     sub.add_parser("tic-tac-toe", aliases=["ttt"], help="start Loopy straight into a game of tic-tac-toe")
+    sub.add_parser("snake", help="start Loopy straight into a game of snake (you play, Loopy cheers)")
     setup = sub.add_parser("setup", help="download the models Loopy needs")
     setup.add_argument("--voice", help="voice id to download and use (see 'loopy voices')")
     setup.add_argument("--force", action="store_true", help="re-download even if already installed")
+    sub.add_parser("rebuild", help="redo the saved warm-up now (e.g. after changing the prompt), so starts are fast")
     sub.add_parser("voices", help="list the available voices")
     say = sub.add_parser("say", help="speak a line of text, to test the voice")
     say.add_argument("text", nargs="+")
@@ -35,6 +39,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "setup":
         return _setup(args.voice, args.force)
+    if args.command == "rebuild":
+        return _rebuild()
     if args.command == "voices":
         return _voices()
     if args.command == "say":
@@ -48,7 +54,34 @@ def main(argv: list[str] | None = None) -> int:
 
     from loopy.app import run
 
-    return run(start_with_game=args.command in ("tic-tac-toe", "ttt"))
+    games = {"tic-tac-toe": "tic-tac-toe", "ttt": "tic-tac-toe", "snake": "snake"}
+    return run(start_with_game=games.get(args.command))
+
+
+def _rebuild() -> int:
+    """Redo the saved warm-up now, so the next `loopy` start is fast."""
+    import time
+
+    from loopy import models
+    from loopy.brain import Brain
+
+    if not models.llm_installed():
+        print("The conversation model isn't installed yet. Run: loopy setup")
+        return 1
+    print("Rebuilding Loopy's saved warm-up. This reads the whole prompt once,")
+    print("which takes 1-2 minutes on a laptop CPU...", flush=True)
+    started = time.monotonic()
+    brain = Brain(models.llm_path())
+    brain.load(fresh=True)
+    seconds = time.monotonic() - started
+    if brain.warmup_path is None:
+        print(f"\nCouldn't save the warm-up ({brain.warmup_error or 'unknown error'}).")
+        print("Loopy still works, it just starts slowly. Free some RAM or disk space and try again.")
+        return 1
+    size = brain.warmup_path.stat().st_size / 2**30
+    print(f"\nDone in {seconds:.0f} s. Saved {brain.warmup_path.name} ({size:.2f} GB).")
+    print("The next `loopy` start will be fast.")
+    return 0
 
 
 def _setup(voice_id: str | None, force: bool) -> int:

@@ -186,19 +186,74 @@ class StartingWithoutAsking(GameTest):
         self.assertIn(("place", 1, "O"), events)
 
 
+class Snake(GameTest):
+    """Snake: the user plays alone; the brain opens/closes it and remembers."""
+
+    def test_asking_opens_snake(self):
+        said, events = self.turn("let's play snake", "[game: snake] Ooh, snake!")
+        self.assertEqual(events, [("snake_start",)])
+        self.assertTrue(self.brain.snake_open)
+        self.assertIn("arrow keys", said)
+
+    def test_snake_closes_a_running_tic_tac_toe_game(self):
+        self.start()
+        said, events = self.turn("actually let's play snake", "[game: snake] Sure!")
+        self.assertEqual(events, [("stop",), ("snake_start",)])
+        self.assertIsNone(self.brain.game)
+
+    def test_tic_tac_toe_closes_snake(self):
+        self.turn("let's play snake", "[game: snake] Ooh!")
+        said, events = self.start()
+        self.assertEqual(events, [("snake_stop",), ("start", False)])
+        self.assertFalse(self.brain.snake_open)
+
+    def test_stop_closes_snake(self):
+        self.turn("let's play snake", "[game: snake] Ooh!")
+        said, events = self.turn("close the game", "[game: stop] Good game!")
+        self.assertEqual(events, [("snake_stop",)])
+        self.assertFalse(self.brain.snake_open)
+
+    def test_loopy_snake_command_opens_it(self):
+        self.fake = FakeLlama()
+        self.brain._llm = self.fake
+        said, events = [], []
+        self.brain.new_game(said.append, lambda *e: events.append(e), kind="snake")
+        self.assertEqual(events, [("snake_start",)])
+        self.assertEqual(self.fake.calls, [])
+
+    def test_the_result_is_remembered(self):
+        self.turn("let's play snake", "[game: snake] Ooh!")
+        self.brain.note("The user's snake game ended with a score of 12.")
+        self.assertIn("score of 12", self.brain._history[-1]["content"])
+
+    def test_falling_asleep_closes_it(self):
+        self.turn("let's play snake", "[game: snake] Ooh!")
+        self.brain.reset()
+        self.assertFalse(self.brain.snake_open)
+
+    def test_abilities_mention_snake(self):
+        self.assertIn("snake", brain.abilities())
+
+
 class Command(unittest.TestCase):
     def test_loopy_tic_tac_toe_starts_with_a_game(self):
         from loopy import cli
         for command in ("tic-tac-toe", "ttt"):
             with mock.patch("loopy.app.run", return_value=0) as run:
                 cli.main([command])
-            run.assert_called_once_with(start_with_game=True)
+            run.assert_called_once_with(start_with_game="tic-tac-toe")
+
+    def test_loopy_snake_starts_with_snake(self):
+        from loopy import cli
+        with mock.patch("loopy.app.run", return_value=0) as run:
+            cli.main(["snake"])
+        run.assert_called_once_with(start_with_game="snake")
 
     def test_plain_loopy_says_hello_instead(self):
         from loopy import cli
         with mock.patch("loopy.app.run", return_value=0) as run:
             cli.main([])
-        run.assert_called_once_with(start_with_game=False)
+        run.assert_called_once_with(start_with_game=None)
 
 
 class Moves(GameTest):

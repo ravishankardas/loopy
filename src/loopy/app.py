@@ -9,6 +9,7 @@ in one go, asleep or awake. Falling asleep ends the conversation.
 """
 
 import os
+import random
 import signal
 import sys
 import threading
@@ -19,13 +20,15 @@ from PySide6.QtCore import QObject, QTimer, Signal
 from PySide6.QtWidgets import QApplication, QInputDialog, QMenu
 
 from loopy import models, settings, wake
-from loopy.game import BoardWindow
+from loopy.game import X_COLOR, BoardWindow, Celebration
+from loopy.snake import SnakeWindow
 from loopy.listener import KNOCK_ABOVE_NOISE, KNOCK_PEAK
 from loopy.mascot import Activity, Mascot, State
 from loopy.models import Voice
 
 DEFAULT_SLEEP_AFTER = 60  # seconds without activity before Loopy dozes off
 GAME_SLEEP_AFTER = 300    # ...longer during a game, so you have time to think
+SNAKE_ANSWER_SECONDS = 30 # "still playing snake?" with no answer: close it
 
 
 def _log(text: str = "", end: str = "\n") -> None:
@@ -82,7 +85,12 @@ class Assistant(QObject):
         self._hearing = False                # someone is talking right now
         self._brain_loaded = False
         self.brain_error = ""
-        self.start_with_game = False         # `loopy tic-tac-toe`: a game instead of hello
+        self.start_with_game: str | None = None  # "tic-tac-toe"/"snake": a game instead of hello
+        self.snake: SnakeWindow | None = None
+        self._party: Celebration | None = None   # new-best celebration for snake
+        self._snake_answer_timer = QTimer(self)  # "still playing?" unanswered -> close
+        self._snake_answer_timer.setSingleShot(True)
+        self._snake_answer_timer.timeout.connect(self._on_snake_no_answer)
         self._spoken = ""                    # what the bubble shows while talking
         self.speaker = None
         self.voice: Voice | None = settings.active_voice()
@@ -205,6 +213,10 @@ class Assistant(QObject):
             status = ("Listening...", Activity.LISTENING)
         elif not self._brain_loaded:
             status = ("Getting ready...", Activity.BUSY)
+        elif self._snake_on and self.snake.idle_paused:
+            status = ("Snake paused · still playing?", Activity.IDLE)
+        elif self._snake_on:
+            status = (f"Snake · score {self.snake.game.score}", Activity.IDLE)
         elif self._game_on:
             status = ("Tic-tac-toe · your turn", Activity.IDLE)
         else:
@@ -228,7 +240,7 @@ class Assistant(QObject):
         # Only now, with the model loaded, does Loopy say hello (unless you
         # already asked something while it was loading: then it just answers).
         if self.start_with_game and not self._thinking:
-            self.play_game()  # `loopy tic-tac-toe`: straight into a game instead of hello
+            self.play_game(self.start_with_game)  # `loopy tic-tac-toe` / `loopy snake`: a game instead of hello
         elif self.listener is not None and self.speaker and self.transcriber and not self._thinking:
             self.say("Hi! I'm Loopy. Say hey Loopy whenever you want to chat.")
         self._keep_awake()
@@ -259,6 +271,8 @@ class Assistant(QObject):
             self.brain.reset()  # a new wake-up starts a new conversation (and ends any game)
         if self.board:
             self.board.hide()
+        if self.snake:
+            self.snake.hide()
         self.mascot.set_state(State.SLEEPING)
         self.mascot.show_bubble("", 0)
         self._refresh_status()
@@ -275,7 +289,8 @@ class Assistant(QObject):
 
     @property
     def _game_on(self) -> bool:
-        return bool(self.brain and self.brain.game and not self.brain.game.over)
+        tic_tac_toe = bool(self.brain and self.brain.game and not self.brain.game.over)
+        return tic_tac_toe or self._snake_on
 
     def _busy(self) -> None:
         self._sleep_timer.stop()
@@ -340,16 +355,17 @@ class Assistant(QObject):
 
     # ---------------------------------------------------------------- brain
 
-    def play_game(self) -> None:
-        """Start tic-tac-toe right away (`loopy tic-tac-toe`, or the menu)."""
+    def play_game(self, kind: str = "tic-tac-toe") -> None:
+        """Start a game right away (`loopy tic-tac-toe` / `loopy snake`, or
+        the menu). kind: "tic-tac-toe" or "snake"."""
         if not self.awake:
             self.wake_up(greet=False)
-        self.think("", new_game=True)
+        self.think("", new_game=kind)
 
-    def think(self, text: str, new_game: bool = False) -> None:
-        """Send what the user said to the brain (or, with new_game, start a
-        game of tic-tac-toe). Its words go straight into the voice as the
-        model writes them. Runs off the UI thread."""
+    def think(self, text: str, new_game: str | None = None) -> None:
+        """Send what the user said to the brain (or, with new_game, start
+        that game). Its words go straight into the voice as the model writes
+        them. Runs off the UI thread."""
         text = text.strip()
         if not text and not new_game:
             return
@@ -360,7 +376,8 @@ class Assistant(QObject):
         self._busy()
         self._thinking = True
         self.mascot.set_state(State.WORKING)
-        self.mascot.show_bubble("Tic-tac-toe time!" if new_game else f'"{text}"', None)  # what Loopy heard
+        bubble = {"tic-tac-toe": "Tic-tac-toe time!", "snake": "Snake time!"}.get(new_game, f'"{text}"')
+        self.mascot.show_bubble(bubble, None)  # what Loopy heard
         self._refresh_status()
 
         stream = self._open_speech() if self.speaker else None
@@ -391,7 +408,7 @@ class Assistant(QObject):
         def work():
             try:
                 if new_game:
-                    turn = self.brain.new_game(on_text=out, on_event=on_event)
+                    turn = self.brain.new_game(on_text=out, on_event=on_event, kind=new_game)
                 else:
                     turn = self.brain.respond(text, on_text=out, on_event=on_event)
                 if turn.result is not None and not turn.result.ok:
@@ -425,7 +442,19 @@ class Assistant(QObject):
 
     def _on_game_event(self, event: tuple) -> None:
         kind, *args = event
-        if kind == "start":
+        if kind == "snake_start":
+            self._open_snake()
+        elif kind == "snake_resume":  # "yes, keep playing"
+            self._snake_answer_timer.stop()
+            if self.snake and self.snake.isVisible():
+                self.snake.get_ready()
+            else:
+                self._open_snake()
+        elif kind == "snake_stop":
+            self._snake_answer_timer.stop()
+            if self.snake:
+                self.snake.hide()
+        elif kind == "start":
             (loopy_first,) = args
             if self.board is None:
                 self.board = BoardWindow()
@@ -458,6 +487,84 @@ class Assistant(QObject):
             self.board.hide()
         self._refresh_status()
 
+    # ---------------------------------------------------------------- snake
+
+    def _open_snake(self) -> None:
+        if self.snake is None:
+            self.snake = SnakeWindow(best=settings.load().get("snake_best", 0))
+            self.snake.ate.connect(self._on_snake_ate)
+            self.snake.finished.connect(self._on_snake_over)
+            self.snake.closed.connect(self._on_snake_closed)
+            self.snake.idle.connect(self._on_snake_idle)
+            self.snake.resumed.connect(self._snake_answer_timer.stop)
+        self.snake.new_game()
+        self.snake.open_next_to(self.mascot)
+        self._keep_awake()
+
+    def _on_snake_idle(self) -> None:
+        """The snake kept going in one edge and out the other with nobody
+        steering: the game paused itself. Ask whether they're still playing;
+        "yes" carries on, "no" (or no answer) closes it."""
+        _log("       [snake paused: nobody's steering]")
+        question = self.brain.SNAKE_STILL_PLAYING
+        threading.Thread(target=self.brain.snake_idle, daemon=True).start()  # tells the model how to read the answer
+        self.say(question)
+        self._snake_answer_timer.start(SNAKE_ANSWER_SECONDS * 1000)
+        self._refresh_status()
+
+    def _on_snake_no_answer(self) -> None:
+        if self.snake and self.snake.isVisible() and self.snake.idle_paused:
+            self.snake.hide()
+            if self.brain:
+                self.brain.snake_open = False
+                threading.Thread(target=self.brain.note, daemon=True,
+                                 args=("Nobody answered, so Loopy closed the snake game.",)).start()
+            _log("       ── snake closed: no answer ──")
+            self.say("No answer, so I closed the snake game. Say let's play snake anytime!")
+            self._refresh_status()
+
+    def _on_snake_ate(self, score: int) -> None:
+        self._keep_awake()  # playing counts as activity: no dozing off mid-game
+        self.mascot.show_bubble(f"Yum! {score}", 900)
+        if score % 5 == 0:  # cheer now and then, not on every bite
+            self.say(random.choice([f"{score}! Keep going!", f"Nice, {score}!", f"{score} already, wow!"]))
+        self._refresh_status()
+
+    def _on_snake_over(self, score: int) -> None:
+        best_before = settings.load().get("snake_best", 0)
+        if score > best_before:
+            settings.save(snake_best=score)
+            self.say(f"Game over! You scored {score}, that's a new best!")
+            if self._party is None:
+                self._party = Celebration()
+            self._party.play(f"New best: {score}!", X_COLOR, self.snake.frameGeometry().center())
+        elif score == 0:
+            self.say("Game over! Zero this time, give it another go!")
+        else:
+            self.say(f"Game over! You scored {score}. Your best is {best_before}.")
+        _log(f"       [snake over: score {score}, best {max(score, best_before)}]")
+        best = max(score, best_before)
+        threading.Thread(target=self.brain.note, daemon=True, args=(
+            f"The user's snake game ended with a score of {score} (their best is {best}). "
+            "The window is still open: Space plays again.",)).start()
+        self._keep_awake()
+        self._refresh_status()
+
+    def _on_snake_closed(self) -> None:
+        """Closed with Esc (not by asking Loopy)."""
+        self._snake_answer_timer.stop()
+        if self.brain:
+            self.brain.snake_open = False
+            threading.Thread(target=self.brain.note, daemon=True,
+                             args=("The user closed the snake game.",)).start()
+        _log("       ── snake closed ──")
+        self._keep_awake()
+        self._refresh_status()
+
+    @property
+    def _snake_on(self) -> bool:
+        return bool(self.snake and self.snake.isVisible())
+
     def _ask_by_typing(self) -> None:
         text, ok = QInputDialog.getText(self.mascot, "Loopy", "Say something to Loopy:")
         if ok and text.strip():
@@ -469,7 +576,8 @@ class Assistant(QObject):
     def _extend_menu(self, menu: QMenu) -> None:
         menu.addAction("Type to Loopy...", self._ask_by_typing)
         if self._brain_loaded and not self._game_on and not self._thinking:
-            menu.addAction("Play tic-tac-toe", self.play_game)
+            menu.addAction("Play tic-tac-toe", lambda: self.play_game("tic-tac-toe"))
+            menu.addAction("Play snake", lambda: self.play_game("snake"))
         if self.awake:
             menu.addAction("Go to sleep", self.go_to_sleep)
         else:
@@ -674,9 +782,10 @@ def _quit_on_ctrl_c(app: QApplication) -> QTimer:
     return wake_timer  # caller must keep a reference
 
 
-def run(start_with_game: bool = False) -> int:
-    """Start Loopy. With start_with_game (`loopy tic-tac-toe`), it jumps
-    straight into a game once its brain has loaded, instead of saying hello."""
+def run(start_with_game: str | None = None) -> int:
+    """Start Loopy. With start_with_game ("tic-tac-toe" or "snake", from
+    `loopy tic-tac-toe` / `loopy snake`), it jumps straight into that game
+    once its brain has loaded, instead of saying hello."""
     # The Windows console can't encode some characters a model may write
     # (curly quotes, accents...); print a "?" instead of crashing.
     for s in (sys.stdout, sys.stderr):
