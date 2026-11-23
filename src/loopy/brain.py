@@ -279,7 +279,7 @@ class Brain:
 
                 self._llm = Llama(str(self._model_path), n_ctx=N_CTX, n_threads=N_THREADS,
                                   n_threads_batch=N_THREADS_BATCH, verbose=False)
-                warmup = self._messages([{"role": "user", "content": "hi"}])
+                warmup = self._warmup_messages()
                 if not fresh and self._restore_warmup(warmup):
                     self.warmup_source = "saved"
                 else:
@@ -291,6 +291,15 @@ class Brain:
             return self._llm
 
     # ------------------------------------------------------- saved warm-up
+
+    def warmup_ready(self) -> bool:
+        """Is there a saved warm-up for the current prompt, model and
+        settings? (Cheap: compares fingerprints, doesn't load the model.)"""
+        return self._warmup_file(self._warmup_messages()).is_file()
+
+    def _warmup_messages(self) -> list[dict]:
+        """What the warm-up reads: the system prompt and examples, plus a "hi"."""
+        return self._messages([{"role": "user", "content": "hi"}])
 
     def _warmup_file(self, warmup: list[dict]) -> Path:
         import llama_cpp

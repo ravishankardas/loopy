@@ -126,6 +126,16 @@ def _setup(voice_id: str | None, force: bool) -> int:
         except OSError as exc:
             print(f"\nDownload failed: {exc}\nCheck your internet connection and run 'loopy setup' again.")
             return 1
+    # Read the prompt once now and save the result, so the first `loopy`
+    # start is fast too (~5 s instead of ~2 min). Skipped if it's up to date.
+    from loopy.brain import Brain
+
+    print("Saved warm-up:")
+    if Brain(models.llm_path()).warmup_ready() and not force:
+        print("  already built")
+    elif _rebuild() != 0:
+        print("Setup finished, but without the saved warm-up: the first start will be slow.")
+        return 0
     print("Done. Start Loopy with: loopy")
     return 0
 

@@ -131,6 +131,47 @@ class SavedWarmup(unittest.TestCase):
              mock.patch.object(FakeModel, "save_state", side_effect=MemoryError):
             self.assertEqual(cli.main(["rebuild"]), 1)
 
+    def test_warmup_ready_follows_the_fingerprint(self):
+        self.assertFalse(Brain(self.model).warmup_ready())        # fresh clone: nothing saved
+        self.start()
+        self.assertTrue(Brain(self.model).warmup_ready())
+        with mock.patch.object(brain, "_system_prompt", lambda: "a different prompt"):
+            self.assertFalse(Brain(self.model).warmup_ready())    # prompt changed: out of date
+        self.assertEqual(FakeModel.instances[-1].warmups, 1)      # checking never loads a model
+
+    def setup_command(self, *args: str) -> int:
+        """Run `loopy setup` with every download already done."""
+        from types import SimpleNamespace
+
+        from loopy import cli, models, settings
+        voice = SimpleNamespace(label="Test voice", installed=True, id="test")
+        with mock.patch.object(models, "llm_path", lambda: self.model), \
+             mock.patch.object(models, "llm_installed", lambda: True), \
+             mock.patch.object(models, "stt_installed", lambda: True), \
+             mock.patch.object(settings, "selected_voice", lambda: voice):
+            return cli.main(["setup", *args])
+
+    def test_first_setup_builds_the_warmup(self):
+        # Requested: after a fresh clone, `loopy setup` also does `loopy rebuild`,
+        # so even the very first start is fast.
+        self.assertEqual(self.setup_command(), 0)
+        self.assertEqual(len(self.saved_files()), 1)
+        b, model = self.start()
+        self.assertEqual(model.warmups, 0)
+        self.assertEqual(b.warmup_source, "saved")
+
+    def test_setup_again_skips_an_up_to_date_warmup(self):
+        self.setup_command()
+        built = len(FakeModel.instances)
+        self.assertEqual(self.setup_command(), 0)
+        self.assertEqual(len(FakeModel.instances), built)          # no second 2-minute warm-up
+
+    def test_setup_rebuilds_an_out_of_date_warmup(self):
+        self.setup_command()
+        with mock.patch.object(brain, "_system_prompt", lambda: "a different prompt"):
+            self.setup_command()
+            self.assertTrue(Brain(self.model).warmup_ready())
+
     def test_failing_to_save_doesnt_break_loading(self):
         with mock.patch.object(FakeModel, "save_state", side_effect=MemoryError):
             b, model = self.start()
