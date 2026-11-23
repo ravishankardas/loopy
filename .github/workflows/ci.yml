@@ -22,8 +22,8 @@ jobs:
     name: Lint and type check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.11"
           cache: pip
@@ -46,8 +46,8 @@ jobs:
           - os: ubuntu-latest
             python: "3.12"
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python }}
           cache: pip
@@ -55,9 +55,18 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          # PortAudio for sounddevice; the rest is what Qt needs to start without a screen.
+          # PortAudio for sounddevice; PulseAudio because PortAudio connects to a
+          # sound server as soon as sounddevice is imported; the rest is what Qt
+          # needs to start without a screen.
           sudo apt-get install -y --no-install-recommends \
-            libportaudio2 libegl1 libgl1 libxkbcommon0 libfontconfig1 libdbus-1-3
+            libportaudio2 pulseaudio libegl1 libgl1 libxkbcommon0 libfontconfig1 libdbus-1-3
+      - name: Silent sound server (Linux)
+        if: runner.os == 'Linux'
+        # No sound card on CI: a PulseAudio server with a "null" sink (audio goes nowhere).
+        run: |
+          pulseaudio -D --exit-idle-time=-1
+          pactl load-module module-null-sink sink_name=dummy
+          pactl info | grep -i "server name"
       - name: Install
         run: pip install -e .
       - name: Run tests
