@@ -12,7 +12,6 @@ from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
 from fakes import FakeLlama, RecordedActions  # noqa: E402
-
 from loopy import actions  # noqa: E402
 from loopy.brain import Brain  # noqa: E402
 from loopy.snake import SnakeWindow  # noqa: E402
@@ -45,7 +44,7 @@ class WindowPausesItself(unittest.TestCase):
 
     def test_an_arrow_key_carries_on(self):
         self.run_untouched()
-        QTest.keyClick(self.w, Qt.Key_Up)
+        QTest.keyClick(self.w, Qt.Key.Key_Up)
         self.assertEqual(self.resumed, [True])
         self.assertFalse(self.w.paused)
         self.assertEqual(self.w.game.wraps_untouched, 0)
@@ -53,7 +52,7 @@ class WindowPausesItself(unittest.TestCase):
     def test_steering_now_and_then_never_pauses(self):
         for i in range(200):
             if i % 15 == 0:
-                QTest.keyClick(self.w, Qt.Key_Up if (i // 15) % 2 else Qt.Key_Right)
+                QTest.keyClick(self.w, Qt.Key.Key_Up if (i // 15) % 2 else Qt.Key.Key_Right)
             self.w._step()
             if self.w.game.over:
                 break
@@ -63,7 +62,7 @@ class WindowPausesItself(unittest.TestCase):
         self.run_untouched()
         self.w.get_ready()                        # "yes, keep playing" by voice
         self.assertTrue(self.w.paused)            # still waiting for the player's hands
-        QTest.keyClick(self.w, Qt.Key_Left)
+        QTest.keyClick(self.w, Qt.Key.Key_Left)
         self.assertFalse(self.w.paused)
 
 

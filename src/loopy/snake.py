@@ -19,7 +19,7 @@ import random
 import time
 from collections import deque
 
-from PySide6.QtCore import QPoint, QPointF, QRectF, Qt, QTimer, Signal
+from PySide6.QtCore import QPointF, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QPainter, QPen
 from PySide6.QtWidgets import QWidget
 
@@ -109,8 +109,8 @@ SOFT = QColor(20, 20, 24, 150)
 GRID_DOT = QColor(20, 20, 24, 28)
 FOOD = QColor(235, 70, 70)
 
-KEYS = {Qt.Key_Up: "up", Qt.Key_W: "up", Qt.Key_Down: "down", Qt.Key_S: "down",
-        Qt.Key_Left: "left", Qt.Key_A: "left", Qt.Key_Right: "right", Qt.Key_D: "right"}
+KEYS = {Qt.Key.Key_Up: "up", Qt.Key.Key_W: "up", Qt.Key.Key_Down: "down", Qt.Key.Key_S: "down",
+        Qt.Key.Key_Left: "left", Qt.Key.Key_A: "left", Qt.Key.Key_Right: "right", Qt.Key.Key_D: "right"}
 
 
 class SnakeWindow(QWidget):
@@ -131,15 +131,15 @@ class SnakeWindow(QWidget):
 
     def __init__(self, best: int = 0):
         super().__init__()
-        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
-        self.setAttribute(Qt.WA_TranslucentBackground)
-        self.setFocusPolicy(Qt.StrongFocus)  # it needs the keyboard
+        self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.Tool)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)  # it needs the keyboard
         self.setFixedSize(self.W, self.H)
         self.best = best
         self.partners: list[QWidget] = []    # Loopy: they move together
-        self._title = QFont("Segoe UI", 13, QFont.Bold)
+        self._title = QFont("Segoe UI", 13, QFont.Weight.Bold)
         self._small = QFont("Segoe UI", 9)
-        self._big = QFont("Segoe UI", 16, QFont.Bold)
+        self._big = QFont("Segoe UI", 16, QFont.Weight.Bold)
         self._drag = None
         self._tick = QTimer(self)
         self._tick.timeout.connect(self._step)
@@ -161,7 +161,7 @@ class SnakeWindow(QWidget):
 
     def open_next_to(self, widget: QWidget) -> None:
         """Show beside Loopy (left, or right if there's no room), tied to it."""
-        from loopy.mascot import move_together
+        from loopy.mascot import move_together, tie
 
         geo = widget.frameGeometry()
         screen = (widget.screen() or self.screen()).availableGeometry()
@@ -169,9 +169,7 @@ class SnakeWindow(QWidget):
         if x < screen.left():
             x = geo.right() + 8
         self.move(x, geo.bottom() - self.H - 30)
-        self.partners = [widget]
-        if hasattr(widget, "partners"):
-            widget.partners = [self]
+        tie(self, widget)
         self.show()
         move_together(self, self.pos(), self.partners)
         self.grab_keyboard()
@@ -189,10 +187,9 @@ class SnakeWindow(QWidget):
 
     def hide(self) -> None:
         self._tick.stop()
-        for partner in self.partners:
-            if getattr(partner, "partners", None) is not None and self in partner.partners:
-                partner.partners.remove(self)
-        self.partners = []
+        from loopy.mascot import untie
+
+        untie(self)  # Loopy moves on its own again
         super().hide()
 
     # ----------------------------------------------------------- game loop
@@ -228,15 +225,15 @@ class SnakeWindow(QWidget):
 
     def keyPressEvent(self, event):
         key = event.key()
-        if key == Qt.Key_Escape:
+        if key == Qt.Key.Key_Escape:
             self.hide()
             self.closed.emit()
             return
         if self.game.over:
-            if key in (Qt.Key_Space, Qt.Key_Return, Qt.Key_Enter):
+            if key in (Qt.Key.Key_Space, Qt.Key.Key_Return, Qt.Key.Key_Enter):
                 self.new_game()
             return
-        if key == Qt.Key_Space and self._started:
+        if key == Qt.Key.Key_Space and self._started:
             if self.paused:
                 self._run()
             else:
@@ -264,7 +261,7 @@ class SnakeWindow(QWidget):
 
     def paintEvent(self, _event):
         p = QPainter(self)
-        p.setRenderHint(QPainter.Antialiasing)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
         p.setPen(QPen(CARD_EDGE, 1.5))
         p.setBrush(CARD)
         p.drawRoundedRect(QRectF(4, 4, self.W - 8, self.H - 8), 18, 18)
@@ -274,16 +271,16 @@ class SnakeWindow(QWidget):
         p.drawText(QPointF(24, 40), "Snake")
         p.setFont(self._small)
         p.setPen(SOFT)
-        p.drawText(QRectF(0, 26, self.W - 24, 20), Qt.AlignRight | Qt.AlignVCenter,
+        p.drawText(QRectF(0, 26, self.W - 24, 20), Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
                    f"Score {self.game.score}   ·   Best {max(self.best, self.game.score)}")
 
         # Play area: a faint dot grid inside a dashed frame (dashed: the edges
         # aren't walls, the snake comes back on the other side).
         area = QRectF(self.PAD, self.TOP, self.COLS * self.CELL, self.ROWS * self.CELL)
-        p.setPen(QPen(SOFT, 1.5, Qt.DashLine))
-        p.setBrush(Qt.NoBrush)
+        p.setPen(QPen(SOFT, 1.5, Qt.PenStyle.DashLine))
+        p.setBrush(Qt.BrushStyle.NoBrush)
         p.drawRoundedRect(area.adjusted(-2, -2, 2, 2), 6, 6)
-        p.setPen(Qt.NoPen)
+        p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(GRID_DOT)
         for x in range(self.COLS):
             for y in range(self.ROWS):
@@ -325,7 +322,8 @@ class SnakeWindow(QWidget):
 
         p.setFont(self._small)
         p.setPen(SOFT)
-        p.drawText(QRectF(0, self.H - 30, self.W, 20), Qt.AlignCenter, "Arrows / WASD  ·  Space pause  ·  Esc close")
+        p.drawText(QRectF(0, self.H - 30, self.W, 20), Qt.AlignmentFlag.AlignCenter,
+                   "Arrows / WASD  ·  Space pause  ·  Esc close")
 
     def _draw_message(self, p: QPainter, area: QRectF, title: str, hint: str) -> None:
         box = QRectF(area.center().x() - 130, area.center().y() - 36, 260, 72)
@@ -334,16 +332,16 @@ class SnakeWindow(QWidget):
         p.drawRoundedRect(box, 12, 12)
         p.setPen(INK)
         p.setFont(self._big)
-        p.drawText(box.adjusted(0, 6, 0, -30), Qt.AlignCenter, title)
+        p.drawText(box.adjusted(0, 6, 0, -30), Qt.AlignmentFlag.AlignCenter, title)
         p.setFont(self._small)
         p.setPen(SOFT)
-        p.drawText(box.adjusted(0, 38, 0, -6), Qt.AlignCenter, hint)
+        p.drawText(box.adjusted(0, 38, 0, -6), Qt.AlignmentFlag.AlignCenter, hint)
 
     # ---------------------------------------------------------- dragging
 
     def mousePressEvent(self, event):
         self.grab_keyboard()
-        if event.button() == Qt.LeftButton:
+        if event.button() == Qt.MouseButton.LeftButton:
             from loopy.mascot import system_drag
 
             if system_drag(self):  # Wayland: the compositor moves the window
@@ -351,7 +349,7 @@ class SnakeWindow(QWidget):
             self._drag = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
 
     def mouseMoveEvent(self, event):
-        if self._drag is not None and event.buttons() & Qt.LeftButton:
+        if self._drag is not None and event.buttons() & Qt.MouseButton.LeftButton:
             from loopy.mascot import move_together
 
             move_together(self, event.globalPosition().toPoint() - self._drag, self.partners)

@@ -16,7 +16,8 @@ import collections
 import os
 import queue
 import threading
-from typing import Callable
+from collections.abc import Callable
+from dataclasses import dataclass
 
 import numpy as np
 import sounddevice as sd
@@ -47,6 +48,18 @@ KNOCK_GLITCH_SKIP = 0.3      # seconds to ignore after the mic dropped audio (bu
 KNOCK_RESUME_SKIP = 1.0      # seconds to ignore after the mic comes back on (Loopy's voice/clip ending)
 KNOCK_BACKGROUND_SECONDS = 2.0
 KNOCK_COOLDOWN = 2.0         # seconds; one hit triggers once
+
+
+@dataclass(frozen=True)
+class KnockReading:
+    """How one frame scored on the knock tests (see Listener(on_sound=...))."""
+    peak: float
+    above_noise: float      # how many times louder than the room
+    sharpness: float        # peak / average level
+    speech_prob: float
+    knocked: bool
+    learning: bool = False  # still learning the room's level (first second)
+    cooling_down: bool = False  # right after another knock
 
 
 class VoiceDetector:
@@ -88,6 +101,7 @@ class Listener:
         on_knock: Callable[[float], None] | None = None,
         knock_peak: float = KNOCK_PEAK,
         knock_above_noise: float = KNOCK_ABOVE_NOISE,
+        on_sound: Callable[[KnockReading], None] | None = None,
     ):
         """Callbacks run on the listener thread. `on_utterance` gets mono
         float32 audio at 16 kHz, or an empty array if the speech turned out
@@ -97,10 +111,12 @@ class Listener:
         self._on_speech_start = on_speech_start
         self._on_level = on_level
         self._on_knock = on_knock
+        self._on_sound = on_sound        # every frame's knock reading (for `loopy knock-test`)
         self.knock_peak = knock_peak
         self.knock_above_noise = knock_above_noise   # the main sensitivity knob
         # Background: the room's level over the last 2 s (per 8 ms block).
-        self._background = collections.deque(maxlen=int(KNOCK_BACKGROUND_SECONDS * SAMPLE_RATE / KNOCK_BLOCK))
+        self._background_size = int(KNOCK_BACKGROUND_SECONDS * SAMPLE_RATE / KNOCK_BLOCK)
+        self._background: collections.deque[float] = collections.deque(maxlen=self._background_size)
         self._last_knock = -1e9
         self._frames_seen = 0
         self._glitch = False             # set by the audio thread when input was dropped
@@ -207,7 +223,7 @@ class Listener:
         skipping = self._knock_skip > 0
         if skipping:
             self._knock_skip -= 1
-        learned = len(self._background) >= self._background.maxlen // 2   # ~1 s of room first
+        learned = len(self._background) >= self._background_size // 2   # ~1 s of room first
         is_knock = (
             self.knocks_enabled
             and learned
@@ -218,6 +234,10 @@ class Listener:
             and speech_prob < START_PROB           # a shout isn't a knock
             and now - self._last_knock >= KNOCK_COOLDOWN
         )
+        if self._on_sound:
+            self._on_sound(KnockReading(peak, above_noise, sharpness, speech_prob, is_knock,
+                                        learning=not learned, cooling_down=not is_knock and
+                                        now - self._last_knock < KNOCK_COOLDOWN))
         if is_knock:
             self._last_knock = now
             self.last_knock = (peak, above_noise, sharpness)
@@ -241,6 +261,7 @@ class Listener:
             self._was_paused = False
             self._knock_skip = max(self._knock_skip, int(KNOCK_RESUME_SKIP * SAMPLE_RATE / FRAME))
 
+        assert self._vad is not None, "start() loads the voice detector first"
         prob = self._vad(frame)
         self._check_knock(frame, prob)
 

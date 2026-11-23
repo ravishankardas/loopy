@@ -11,8 +11,8 @@ CHECKS.
 
 import datetime
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable
 
 import psutil
 

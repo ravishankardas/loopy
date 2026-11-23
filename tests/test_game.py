@@ -10,7 +10,6 @@ import unittest
 from unittest import mock
 
 from fakes import FakeLlama, RecordedActions
-
 from loopy import actions, brain
 from loopy.brain import Brain
 from loopy.game import WIN_LINES, TicTacToe
@@ -38,7 +37,7 @@ class Rules(unittest.TestCase):
 
     def test_draw(self):
         game = TicTacToe()
-        for cell, mark in zip([1, 2, 3, 5, 4, 6, 8, 7, 9], "XOXOXOXOX"):
+        for cell, mark in zip([1, 2, 3, 5, 4, 6, 8, 7, 9], "XOXOXOXOX", strict=True):
             game.place(cell, mark)
         self.assertEqual(game.winner, "draw")
         self.assertIsNone(game.line)
@@ -79,7 +78,7 @@ class GameTest(unittest.TestCase):
         self.fake = FakeLlama(*model_replies)
         self.brain._llm = self.fake
         said, events = [], []
-        turn = self.brain.respond(user, said.append, lambda *e: events.append(e))
+        self.brain.respond(user, said.append, lambda *e: events.append(e))
         self.assertEqual(self.fake.replies, [], "the model wasn't asked as often as expected")
         return "".join(said).strip(), events
 
@@ -173,7 +172,7 @@ class TrashTalk(GameTest):
 
     def test_the_same_taunt_isnt_used_twice_in_a_row(self):
         picks = [self.brain._taunt(brain.TAUNT_DRAW) for _ in range(30)]
-        self.assertTrue(all(a != b for a, b in zip(picks, picks[1:])))
+        self.assertTrue(all(a != b for a, b in zip(picks, picks[1:], strict=False)))
 
     def test_the_model_sees_the_users_last_move(self):
         # So it can tease it ("Top-middle? Cute.") instead of only talking about itself.
@@ -231,7 +230,7 @@ class StartingWithoutAsking(GameTest):
     def test_new_game_opens_the_board_and_you_go_first(self):
         said, events = self.new_game()
         self.assertEqual(events, [("start", False)])
-        self.assertIn("Yay, let's play!", said)
+        self.assertIn("Oh, you want to lose? Fine.", said)
         self.assertIn("You go first", said)
         self.assertEqual(self.fake.calls, [])          # no model call needed to start
 

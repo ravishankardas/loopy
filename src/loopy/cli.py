@@ -156,13 +156,13 @@ def _chat(speak: bool) -> int:
             print("loopy> ", end="", flush=True)
             stream = speaker.stream() if speaker else None
 
-            def on_text(piece: str) -> None:  # printed (and spoken) as it's written
+            def on_text(piece: str, stream=stream) -> None:  # printed (and spoken) as it's written
                 print(piece, end="", flush=True)
                 if stream:
                     stream.feed(piece)
 
             def on_event(kind, *args) -> None:  # tic-tac-toe: show the board as text
-                if kind == "place":
+                if kind == "place" and brain.game is not None:
                     cell, mark = args
                     who = "you" if mark == "X" else "Loopy"
                     board = "\n".join(f"        {row}" for row in brain.game.describe().splitlines())
@@ -249,13 +249,54 @@ def _knock_test() -> int:
     s = settings.load()
     peak_needed = s.get("knock_peak", L.KNOCK_PEAK)
     above_needed = s.get("knock_above_noise", L.KNOCK_ABOVE_NOISE)
-    knocks = []
+    knocks: list[float] = []
 
     def on_knock(peak: float) -> None:
         knocks.append(peak)
         bridge.knocked.emit()
 
-    mic = L.Listener(on_utterance=lambda _a: None, on_knock=on_knock,
+    class SoundReport:
+        """Groups frames into sounds; prints one line per sound (its strongest
+        moment) and why it did or didn't count as a knock."""
+
+        def __init__(self) -> None:
+            self.reset()
+
+        def reset(self) -> None:
+            self.best: L.KnockReading | None = None
+            self.knocked = self.learning = self.cooling = False
+            self.quiet = 0
+
+        def __call__(self, r: L.KnockReading) -> None:
+            if r.above_noise >= 4:  # clearly louder than the room: part of a sound
+                if self.best is None or r.above_noise > self.best.above_noise:
+                    self.best = r
+                self.knocked |= r.knocked
+                self.learning |= r.learning
+                self.cooling |= r.cooling_down
+                self.quiet = 0
+            elif self.best is not None:
+                self.quiet += 1
+                if self.quiet >= 4:  # ~130 ms of calm: that sound is over
+                    self.print_line(self.best)
+                    self.reset()
+
+        def print_line(self, b: L.KnockReading) -> None:
+            why = [w for w, bad in [
+                ("not loud enough vs the room", b.above_noise < above_needed),
+                ("peak too low", b.peak < peak_needed),
+                ("not sharp", b.sharpness < L.KNOCK_SHARPNESS),
+                ("sounded like speech", b.speech_prob >= L.START_PROB)] if bad]
+            if not why:
+                why = ["still learning the room, first second"] if self.learning else \
+                      ["cooldown: just after another knock"]
+            verdict = "KNOCK! -> ho yeah" if self.knocked else f"not a knock ({', '.join(why)})"
+            print(f"  {b.above_noise:6.1f}x louder than the room (need {above_needed:g})"
+                  f"   peak {b.peak:.3f} (need {peak_needed:g})"
+                  f"   sharpness {b.sharpness:.1f} (need {L.KNOCK_SHARPNESS:g})"
+                  f"   speech {b.speech_prob:.2f}   {verdict}", flush=True)
+
+    mic = L.Listener(on_utterance=lambda _a: None, on_knock=on_knock, on_sound=SoundReport(),
                      knock_peak=peak_needed, knock_above_noise=above_needed)
 
     def play() -> None:
@@ -264,35 +305,6 @@ def _knock_test() -> int:
 
     bridge.knocked.connect(play)
     clip.finished.connect(lambda: QTimer.singleShot(300, mic.resume))
-    original = mic._check_knock
-    sound = {"best": None, "knock": False, "quiet": 0, "learning": False}  # the sound being heard now
-
-    def report(frame, speech_prob):  # one line per sound: its strongest moment, and whether it counted
-        before = len(knocks)
-        peak, above, sharp = mic.knock_score(frame)
-        learning = len(mic._background) < mic._background.maxlen // 2
-        original(frame, speech_prob)
-        if above >= 4:
-            if sound["best"] is None or above > sound["best"][1]:
-                sound["best"] = (peak, above, sharp, speech_prob)
-            sound["learning"] |= learning
-            sound["knock"] |= len(knocks) > before
-            sound["quiet"] = 0
-        elif sound["best"] is not None:
-            sound["quiet"] += 1
-            if sound["quiet"] >= 4:  # ~130 ms of calm: that sound is over
-                p, a, sh, sp = sound["best"]
-                why = [] if sound["knock"] else [w for w, bad in [
-                    ("not loud enough vs the room", a < above_needed), ("peak too low", p < peak_needed),
-                    ("not sharp", sh < L.KNOCK_SHARPNESS), ("sounded like speech", sp >= L.START_PROB)] if bad]
-                if not why:
-                    why = ["still learning the room, first second"] if sound["learning"] else ["cooldown: just after another knock"]
-                verdict = "KNOCK! -> ho yeah" if sound["knock"] else f"not a knock ({', '.join(why)})"
-                print(f"  {a:6.1f}x louder than the room (need {above_needed:g})   peak {p:.3f} (need {peak_needed:g})"
-                      f"   sharpness {sh:.1f} (need {L.KNOCK_SHARPNESS:g})   speech {sp:.2f}   {verdict}", flush=True)
-                sound.update(best=None, knock=False, quiet=0, learning=False)
-
-    mic._check_knock = report
     mic.start()
     print("Hit or tap your laptop a few times, then also talk, type and clap. One line per sound;")
     print("every knock plays the clip, like Loopy does. Ctrl+C to stop.")

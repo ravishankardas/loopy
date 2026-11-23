@@ -22,8 +22,8 @@ synthesized while the current one is still playing, so there are no gaps.
 import queue
 import re
 import threading
+from collections.abc import Callable
 from pathlib import Path
-from typing import Callable
 
 import sounddevice as sd
 from piper import PiperVoice

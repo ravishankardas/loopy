@@ -109,12 +109,12 @@ class BoardWindow(QWidget):
 
     def __init__(self):
         super().__init__()
-        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
-        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.Tool)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setFixedSize(self.W, self.H)
-        self._title = QFont("Segoe UI", 13, QFont.Bold)
+        self._title = QFont("Segoe UI", 13, QFont.Weight.Bold)
         self._small = QFont("Segoe UI", 9)
-        self._number = QFont("Segoe UI", 22, QFont.Bold)
+        self._number = QFont("Segoe UI", 22, QFont.Weight.Bold)
         self._corner = QFont("Segoe UI", 7)
         self._drag = None
         self.partners: list[QWidget] = []  # Loopy, while the board is open: they move together
@@ -153,7 +153,7 @@ class BoardWindow(QWidget):
         """Show the board beside Loopy (left, or right if there's no room),
         bottom-aligned, and tie the two together: dragging either moves both,
         and neither goes past the edge of the screen."""
-        from loopy.mascot import move_together
+        from loopy.mascot import move_together, tie
 
         geo = widget.frameGeometry()
         screen = (widget.screen() or self.screen()).availableGeometry()
@@ -161,9 +161,7 @@ class BoardWindow(QWidget):
         if x < screen.left():                       # no room on the left: go right
             x = geo.right() + 8
         self.move(x, geo.bottom() - self.H - 30)
-        self.partners = [widget]
-        if hasattr(widget, "partners"):
-            widget.partners = [self]
+        tie(self, widget)
         self._opened = time.monotonic()
         self.show()
         move_together(self, self.pos(), self.partners)  # pull the pair on screen if needed
@@ -178,10 +176,9 @@ class BoardWindow(QWidget):
     def hide(self) -> None:
         if hasattr(self, "_party"):
             self._party.stop()
-        for partner in self.partners:  # untie: Loopy moves on its own again
-            if getattr(partner, "partners", None) is not None and self in partner.partners:
-                partner.partners.remove(self)
-        self.partners = []
+        from loopy.mascot import untie
+
+        untie(self)  # Loopy moves on its own again
         super().hide()
 
     # ------------------------------------------------------------- painting
@@ -193,7 +190,7 @@ class BoardWindow(QWidget):
     def paintEvent(self, _event):
         now = time.monotonic()
         p = QPainter(self)
-        p.setRenderHint(QPainter.Antialiasing)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
 
         # Pop-in: scale up from 85% with a little overshoot, fading in.
         k = min(1.0, (now - self._opened) / OPEN_TIME)
@@ -223,7 +220,7 @@ class BoardWindow(QWidget):
         self._draw_scores(p)
 
     def _draw_grid(self, p: QPainter):
-        p.setPen(QPen(GRID, 3, Qt.SolidLine, Qt.RoundCap))
+        p.setPen(QPen(GRID, 3, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
         size = self.CELL * 3
         for n in (1, 2):
             x = self.GRID_X + n * self.CELL
@@ -237,27 +234,28 @@ class BoardWindow(QWidget):
         if mark is None:  # big number, so you know what to say
             p.setFont(self._number)
             p.setPen(NUMBER)
-            p.drawText(rect, Qt.AlignCenter, str(i + 1))
+            p.drawText(rect, Qt.AlignmentFlag.AlignCenter, str(i + 1))
             return
         p.setFont(self._corner)
         p.setPen(SOFT_TEXT)
-        p.drawText(rect.adjusted(7, 5, 0, 0), Qt.AlignLeft | Qt.AlignTop, str(i + 1))
+        p.drawText(rect.adjusted(7, 5, 0, 0), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop, str(i + 1))
 
         progress = min(1.0, (now - self._placed[i]) / DRAW_TIME)
         c, r = rect.center(), self.CELL * 0.27
         if mark == "X":
-            p.setPen(QPen(INK, 7, Qt.SolidLine, Qt.RoundCap))
+            p.setPen(QPen(INK, 7, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
             a = min(1.0, progress * 2)            # first stroke, then the second
             b = max(0.0, progress * 2 - 1)
             p.drawLine(QPointF(c.x() - r, c.y() - r), QPointF(c.x() - r + 2 * r * a, c.y() - r + 2 * r * a))
             if b > 0:
                 p.drawLine(QPointF(c.x() + r, c.y() - r), QPointF(c.x() + r - 2 * r * b, c.y() - r + 2 * r * b))
         else:
-            p.setPen(QPen(INK, 7, Qt.SolidLine, Qt.RoundCap))
-            p.setBrush(Qt.NoBrush)
+            p.setPen(QPen(INK, 7, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+            p.setBrush(Qt.BrushStyle.NoBrush)
             p.drawArc(QRectF(c.x() - r, c.y() - r, 2 * r, 2 * r), 90 * 16, int(-360 * 16 * progress))
 
     def _draw_win_line(self, p: QPainter, now: float):
+        assert self._win is not None  # only called once there is a winning line
         a, _, b = self._win
         start, end = self._cell_rect(a).center(), self._cell_rect(b).center()
         # Extend a little past the outer cells.
@@ -268,9 +266,9 @@ class BoardWindow(QWidget):
         end = QPointF(end.x() + ux * 26, end.y() + uy * 26)
         k = min(1.0, (now - self._win_at) / LINE_TIME)
         tip = QPointF(start.x() + (end.x() - start.x()) * k, start.y() + (end.y() - start.y()) * k)
-        p.setPen(QPen(QColor(0, 0, 0, 40), 16, Qt.SolidLine, Qt.RoundCap))  # soft gray glow
+        p.setPen(QPen(QColor(0, 0, 0, 40), 16, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))  # soft gray glow
         p.drawLine(start, tip)
-        p.setPen(QPen(INK, 6, Qt.SolidLine, Qt.RoundCap))
+        p.setPen(QPen(INK, 6, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
         p.drawLine(start, tip)
 
     def _draw_scores(self, p: QPainter):
@@ -281,7 +279,7 @@ class BoardWindow(QWidget):
                  ("  ·  ", SOFT_TEXT), (f"Loopy {loopy}", TEXT)]
         widths = [p.fontMetrics().horizontalAdvance(t) for t, _ in parts]
         x = (self.W - sum(widths)) / 2
-        for (text, color), w in zip(parts, widths):
+        for (text, color), w in zip(parts, widths, strict=True):
             p.setPen(color)
             p.drawText(QPointF(x, y), text)
             x += w
@@ -289,7 +287,7 @@ class BoardWindow(QWidget):
     # ---------------------------------------------------------- dragging
 
     def mousePressEvent(self, event):
-        if event.button() == Qt.LeftButton:
+        if event.button() == Qt.MouseButton.LeftButton:
             from loopy.mascot import system_drag
 
             if system_drag(self):  # Wayland: the compositor moves the window
@@ -297,7 +295,7 @@ class BoardWindow(QWidget):
             self._drag = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
 
     def mouseMoveEvent(self, event):
-        if self._drag is not None and event.buttons() & Qt.LeftButton:
+        if self._drag is not None and event.buttons() & Qt.MouseButton.LeftButton:
             from loopy.mascot import move_together
 
             move_together(self, event.globalPosition().toPoint() - self._drag, self.partners)
@@ -321,14 +319,14 @@ class Celebration(QWidget):
 
     def __init__(self):
         super().__init__()
-        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool
-                            | Qt.WindowTransparentForInput)
-        self.setAttribute(Qt.WA_TranslucentBackground)
-        self.setAttribute(Qt.WA_TransparentForMouseEvents)
-        self.setAttribute(Qt.WA_ShowWithoutActivating)
+        self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.Tool
+                            | Qt.WindowType.WindowTransparentForInput)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
         self.setFixedSize(self.W, self.H)
-        self._banner = QFont("Segoe UI", 34, QFont.Black)
-        self._sub = QFont("Segoe UI", 11, QFont.DemiBold)
+        self._banner = QFont("Segoe UI", 34, QFont.Weight.Black)
+        self._sub = QFont("Segoe UI", 11, QFont.Weight.DemiBold)
         self._timer = QTimer(self)
         self._timer.timeout.connect(self.update)
         self._t0 = 0.0
@@ -381,7 +379,7 @@ class Celebration(QWidget):
             self.stop()
             return
         p = QPainter(self)
-        p.setRenderHint(QPainter.Antialiasing)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
         p.setOpacity(min(1.0, (self.DURATION - t) / self.FADE))
         for b in self.balloons:
             self._draw_balloon(p, b, t)
@@ -401,14 +399,14 @@ class Celebration(QWidget):
         string = QPainterPath(QPointF(x, y + r * 1.2))
         for i in range(1, 5):
             string.lineTo(x + 4 * math.sin(t * 4 + i + b["phase"]), y + r * 1.2 + i * 14)
-        p.setBrush(Qt.NoBrush)
+        p.setBrush(Qt.BrushStyle.NoBrush)
         p.setPen(QPen(QColor(255, 255, 255, 140), 1.2))
         p.drawPath(string)
         # Balloon body with a soft shine.
         grad = QRadialGradient(QPointF(x - r * 0.35, y - r * 0.45), r * 1.4)
         grad.setColorAt(0.0, b["color"].lighter(150))
         grad.setColorAt(1.0, b["color"].darker(115))
-        p.setPen(Qt.NoPen)
+        p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(grad)
         p.drawEllipse(QPointF(x, y), r * 0.86, r)
         knot = QPolygonF([QPointF(x - 4, y + r * 1.18), QPointF(x + 4, y + r * 1.18), QPointF(x, y + r * 0.95)])
@@ -431,7 +429,7 @@ class Celebration(QWidget):
         p.save()
         p.translate(x, y)
         p.rotate(c["rot"] + c["spin"] * t)
-        p.setPen(Qt.NoPen)
+        p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(color)
         s = c["size"]
         if c["glitter"]:
@@ -450,7 +448,7 @@ class Celebration(QWidget):
                           QPointF(x + size, y), QPointF(x + size * 0.25, y + size * 0.25),
                           QPointF(x, y + size), QPointF(x - size * 0.25, y + size * 0.25),
                           QPointF(x - size, y), QPointF(x - size * 0.25, y - size * 0.25)])
-        p.setPen(Qt.NoPen)
+        p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(s["color"])
         p.drawPolygon(star)
 
@@ -467,8 +465,9 @@ class Celebration(QWidget):
         p.setBrush(QColor(20, 24, 36, 225))
         p.drawRoundedRect(pill, 42, 42)
         p.setPen(self._color)
-        p.drawText(QRectF(pill.left(), pill.top() - 6, pill.width(), pill.height()), Qt.AlignCenter, self._text)
+        text_area = QRectF(pill.left(), pill.top() - 6, pill.width(), pill.height())
+        p.drawText(text_area, Qt.AlignmentFlag.AlignCenter, self._text)
         p.setFont(self._sub)
         p.setPen(QColor(235, 240, 248, 200))
-        p.drawText(QRectF(pill.left(), 12, pill.width(), 26), Qt.AlignCenter, "Three in a row!")
+        p.drawText(QRectF(pill.left(), 12, pill.width(), 26), Qt.AlignmentFlag.AlignCenter, "Three in a row!")
         p.restore()

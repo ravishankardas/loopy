@@ -11,7 +11,6 @@ import unittest
 from unittest import mock
 
 from fakes import FakeLlama, RecordedActions
-
 from loopy import actions, brain, checks
 from loopy.brain import Brain, _Gate
 

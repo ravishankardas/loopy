@@ -18,8 +18,7 @@ import unittest
 from unittest import mock
 
 from fakes import RecordedActions
-
-from loopy import actions, brain, checks, models
+from loopy import actions, brain, models
 
 ENABLED = os.environ.get("LOOPY_MODEL_TESTS") == "1"
 _brain = None  # loaded once for all tests (~20 s)
@@ -135,7 +134,7 @@ class Capabilities(Conversation):
 
     def test_weather_is_declined_without_tags(self):
         # Reported: "...I can check to find out. [check: time]"
-        turn = self.say("what's the weather like")
+        self.say("what's the weather like")
         self.assertEqual(self.checked, [])
         self.assertIsNone(_brain.pending)
 

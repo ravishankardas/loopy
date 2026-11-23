@@ -19,7 +19,7 @@ SOURCE = Path(checks.__file__).read_text(encoding="utf-8")
 TREE = ast.parse(SOURCE)
 
 # The only modules checks.py may use.
-ALLOWED_IMPORTS = {"datetime", "os", "sys", "dataclasses", "typing", "psutil"}
+ALLOWED_IMPORTS = {"datetime", "os", "sys", "dataclasses", "typing", "collections", "psutil"}
 
 # Every function/method/attribute call checks.py may make. Anything not listed
 # here (open, os.remove, subprocess.run, psutil.Process(...).kill, ...) fails.
@@ -56,7 +56,8 @@ class ChecksAreReadOnly(unittest.TestCase):
             else:
                 continue
             for name in names:
-                self.assertIn(name, ALLOWED_IMPORTS, f"checks.py imports '{name}', which isn't on the read-only allowlist")
+                self.assertIn(name, ALLOWED_IMPORTS,
+                              f"checks.py imports '{name}', which isn't on the read-only allowlist")
 
     def test_only_allowed_calls(self):
         for node in ast.walk(TREE):

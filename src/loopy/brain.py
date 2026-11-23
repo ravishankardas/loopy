@@ -37,12 +37,16 @@ import pickle
 import random
 import re
 import threading
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable
+from typing import TYPE_CHECKING, Any, cast
 
 from loopy import actions, checks
 from loopy.game import CELL_NAMES, TicTacToe
+
+if TYPE_CHECKING:
+    from llama_cpp import Llama
 
 N_CTX = 4096           # tokens the model can see: prompt + examples + conversation
 N_THREADS = 4          # physical cores: writing replies
@@ -132,7 +136,11 @@ While a tic-tac-toe board is open, "close it" or "close the game" means [game: s
 [play: 3] (a free cell number) for your own move, only when the system says it's your turn, then one snippy line of trash talk.
 Lookup results come only from the system. Never write a result, a "system:" line or the user's words yourself.
 Every [none] reply must have words after the tag.
-The example conversation below shows how to reply; it's not part of the real conversation."""
+The example conversation below shows how to reply; it's not part of the real conversation."""  # noqa: E501
+    # (the prompt is prose the model reads; wrapping it would change what it sees)
+
+
+EXAMPLE_TAUNT = "Top-middle? Bold. Wrong, but bold. The center's mine."
 
 
 def _examples() -> list[dict]:
@@ -162,7 +170,7 @@ def _examples() -> list[dict]:
         a("[none] I wish I could, but timers aren't something I can do yet. What's the timer for?"),
         u("open the browser"), a("[ask: open chrome] Want me to open Chrome?"),
         u("no never mind"), a("[none] No problem! So, what's on your mind?"),
-        u("play that tiktok toe game"), a("[game: start] Ooh, tic-tac-toe! Let's go!"),
+        u("play that tiktok toe game"), a("[game: start] Tic-tac-toe? Oh, you want to lose. Fine."),
         u("let's stop playing"), a("[game: stop] Okay, good game!"),
         u("can we play snake"), a("[game: snake] Ooh, snake! Show me what you've got!"),
         a(f"[none] {Brain.SNAKE_STILL_PLAYING}"),
@@ -174,22 +182,22 @@ def _examples() -> list[dict]:
                                       "playing, reply with [game: snake]. If not, reply with [game: stop]."},
         u("no, I'm done"), a("[game: stop] Okay, good game!"),
         # A short tic-tac-toe game, including a rejected move.
-        u("i'm ready to play tic tac toe"), a("[game: start] Yay, game time!"),
+        u("i'm ready to play tic tac toe"), a("[game: start] Bold of you to challenge me. Let's go."),
         {"role": "system", "content": "Tic-tac-toe game started. The user is X, you are O. The user goes first."},
         u("put a cross in 2"), a("[move: 2]"),
         {"role": "system", "content": _board_message(_example_board("-X-------"), "", user_move=2)},
         a("[play: 5] Top-middle? Bold. Wrong, but bold. The center's mine."),
         u("the top left corner"), a("[move: 1]"),
         {"role": "system", "content": _board_message(_example_board("XX--O----"), "", user_move=1,
-                                                     said_before=["Top-middle? Bold. Wrong, but bold. The center's mine."])},
+                                                     said_before=[EXAMPLE_TAUNT])},
         a("[play: 2] Top-middle, mine. Try to keep up."),
         {"role": "system", "content": _board_message(_example_board("XX--O----"),
                                                      "Your move 2 isn't allowed: cell 2 is taken by X.", user_move=1,
-                                                     said_before=["Top-middle? Bold. Wrong, but bold. The center's mine."])},
+                                                     said_before=[EXAMPLE_TAUNT])},
         a("[play: 3] Two in a row? Adorable. Blocked."),
         u("let's stop playing"), a("[game: stop] Okay, good game!"),
         # After a game: declining the rematch, or "close", closes the board (not Chrome).
-        u("let's play tic tac toe"), a("[game: start] Yay!"),
+        u("let's play tic tac toe"), a("[game: start] Back for more? Okay."),
         {"role": "system", "content": "Tic-tac-toe game started. The user is X, you are O. The user goes first."},
         u("put a cross in 7"), a("[move: 7]"),
         {"role": "system", "content": "Game over: the user won. Score: user 1, Loopy 0, draws 0. "
@@ -208,7 +216,7 @@ def _example_board(layout: str) -> TicTacToe:
 
 
 def _board_message(game: TicTacToe, problem: str, user_move: int | None = None,
-                   said_before: list[str] = ()) -> str:
+                   said_before: Sequence[str] = ()) -> str:
     """What the model is shown when it's Loopy's turn. It includes the
     user's last move (so the trash talk can tease it) and what Loopy already
     said this game (so it doesn't repeat itself)."""
@@ -219,7 +227,8 @@ def _board_message(game: TicTacToe, problem: str, user_move: int | None = None,
     return (f"{problem + ' ' if problem else ''}Tic-tac-toe board (you are O, the user is X):\n"
             f"{game.describe()}\n"
             f"{move}It's your turn. Free cells: {free}. Pick one of them: reply with the play tag and its number, "
-            f"then one short, snippy, sassy line of trash talk roasting their move or bragging about yours. {repeat}").strip()
+            "then one short, snippy, sassy line of trash talk roasting their move or bragging about yours. "
+            f"{repeat}").strip()
 
 
 @dataclass
@@ -233,7 +242,7 @@ class Turn:
 class Brain:
     def __init__(self, model_path: Path):
         self._model_path = Path(model_path)
-        self._llm = None
+        self._llm: Llama | None = None
         self.warmup_source: str | None = None  # "saved" (fast start) or "fresh"
         self.warmup_path: Path | None = None   # the saved warm-up file, once written
         self.warmup_error: str | None = None   # why saving it failed, if it did
@@ -253,7 +262,7 @@ class Brain:
         self._on_text: TextOut = lambda _p: None
         self._on_event: GameEvent = lambda *_e: None
 
-    def load(self, fresh: bool = False):
+    def load(self, fresh: bool = False) -> "Llama":
         """Load the model and get it ready: called automatically, but best
         started at app launch. fresh=True ignores any saved warm-up and
         redoes it (`loopy rebuild`).
@@ -276,7 +285,7 @@ class Brain:
                 else:
                     # llama.cpp reuses the shared start of the prompt between
                     # calls, so the system prompt is only processed this once.
-                    self._llm.create_chat_completion(warmup, max_tokens=1)
+                    self._llm.create_chat_completion(cast(Any, warmup), max_tokens=1)  # plain dicts are fine at runtime
                     self._save_warmup(warmup)
                     self.warmup_source = "fresh"
             return self._llm
@@ -298,6 +307,7 @@ class Brain:
         return self._model_path.parent / f"warmup-{key}.state"
 
     def _restore_warmup(self, warmup: list[dict]) -> bool:
+        assert self._llm is not None
         path = self._warmup_file(warmup)
         if not path.is_file():
             return False  # first start, or something changed: warm up fresh
@@ -313,6 +323,7 @@ class Brain:
             return False
 
     def _save_warmup(self, warmup: list[dict]) -> None:
+        assert self._llm is not None
         path = self._warmup_file(warmup)
         tmp = path.with_suffix(".tmp")
         try:
@@ -365,7 +376,8 @@ class Brain:
                 found = [(name, checks.read(name)) for name in new]
                 checked += found
                 self._history.append({"role": "assistant", "content": f"[check: {', '.join(new)}]"})
-                self._history.append({"role": "system", "content": "Result: " + "; ".join(f"{n} = {v}" for n, v in found)})
+                result = "; ".join(f"{n} = {v}" for n, v in found)
+                self._history.append({"role": "system", "content": f"Result: {result}"})
                 gate = self._generate_with_words(llm, on_text)
             if gate.kind == "check":  # still asking instead of answering: say the facts ourselves
                 gate = _Gate(self.pending, on_text)
@@ -376,9 +388,10 @@ class Brain:
             elif checked:
                 # It looked something up but answered vaguely ("pretty busy"):
                 # add the real numbers it left out.
-                for name, value in checked:
+                for _name, value in checked:
                     numbers = re.findall(r"\d+(?:\.\d+)?", value)
-                    if numbers and not any(re.search(rf"(?<![\d.]){re.escape(n)}(?![\d.])", gate.spoken) for n in numbers):
+                    said = any(re.search(rf"(?<![\d.]){re.escape(n)}(?![\d.])", gate.spoken) for n in numbers)
+                    if numbers and not said:
                         gate.say(f"To be exact: {value}.")
 
             if gate.fake_board and gate.kind == "none" and (self.game is None or self.game.over):
@@ -427,8 +440,8 @@ class Brain:
                 self._start_snake()
             else:
                 self._history.append({"role": "user", "content": "Let's play tic-tac-toe!"})
-                self._say("Yay, let's play!")
-                self._remember("game: start", "Yay, let's play!")
+                self._say("Oh, you want to lose? Fine.")
+                self._remember("game: start", "Oh, you want to lose? Fine.")
                 self._close_snake()
                 self._start_game(llm, announce=True)
             return Turn("".join(self._said).strip())
@@ -499,17 +512,19 @@ class Brain:
         # The user's move.
         cell = gate.cell
         self._history.append({"role": "assistant", "content": f"[move: {cell}]"})
+        assert cell is not None  # the gate only reports "move" with a cell
         if self.game is None or self.game.over:
             self._start_game(llm, announce=False, user_first=True)
-        if not self.game.is_free(cell):
-            why = self.game.why_not(cell)
+        game = self._board()
+        if not game.is_free(cell):
+            why = game.why_not(cell)
             self._say(f"Nice try, but {why}! {self._taunt(TAUNT_TAKEN)} "
-                      f"You can pick {_and([str(c) for c in self.game.free()])}.")
+                      f"You can pick {_and([str(c) for c in game.free()])}.")
             self._history.append({"role": "system", "content": f"The user's move didn't count: {why}."})
             return
-        self.game.place(cell, "X")
+        game.place(cell, "X")
         self._on_event("place", cell, "X")
-        if self.game.over:
+        if game.over:
             self._game_over()
         else:
             self._loopy_turn(llm, user_move=cell)
@@ -535,7 +550,7 @@ class Brain:
     def _loopy_turn(self, llm, user_move: int | None = None) -> None:
         """The model picks Loopy's move; the code checks it and, if it's
         illegal, says why and lets the model pick again."""
-        game = self.game
+        game = self._board()
         self._on_event("thinking")
         problem = ""
         for _ in range(MAX_PLAY_TRIES):
@@ -543,7 +558,7 @@ class Brain:
             self._history.append({"role": "system", "content": board})
             gate = self._generate_with_words(llm, self._out, validate_play=game.is_free)
             cell = gate.cell if gate.kind == "play" else None
-            if game.is_free(cell):
+            if cell is not None and game.is_free(cell):
                 if not gate.spoken:  # still silent after the retries: say where it went
                     gate.say(f"I'll take {cell}, {CELL_NAMES[cell]}.")
                 self._game_comments.append(gate.spoken)
@@ -552,7 +567,8 @@ class Brain:
                 self._on_event("place", cell, "O")
                 break
             # Illegal (or no move at all): its comment was never spoken.
-            self._history.append({"role": "assistant", "content": f"[play: {cell}]" if cell else f"[none] {gate.spoken}"})
+            tried = f"[play: {cell}]" if cell else f"[none] {gate.spoken}"
+            self._history.append({"role": "assistant", "content": tried})
             why = game.why_not(cell) if cell else "you didn't pick a cell"
             self._on_event("illegal", cell, why)
             problem = f"Your move {cell} isn't allowed: {why}." if cell else "You must pick a free cell."
@@ -569,8 +585,13 @@ class Brain:
         else:
             self._on_event("your_turn")
 
+    def _board(self) -> TicTacToe:
+        """The game being played (only called while one is on)."""
+        assert self.game is not None, "no tic-tac-toe game is on"
+        return self.game
+
     def _game_over(self) -> None:
-        winner = self.game.winner
+        winner = self._board().winner
         if winner == "X":
             self.scores["you"] += 1
             self._say(f"Three in a row, you win! {self._taunt(TAUNT_YOU_WIN)} Rematch?")
@@ -590,7 +611,7 @@ class Brain:
                               f"Game over: {outcome}. Score: user {s['you']}, Loopy {s['loopy']}, draws {s['draws']}. "
                               "The board is still open. For a rematch reply with [game: start]; "
                               "if they say no, or want to close the game, reply with [game: stop]."})
-        self._on_event("over", winner, self.game.line, dict(s))
+        self._on_event("over", winner, self._board().line, dict(s))
 
     def _taunt(self, options: list[str]) -> str:
         """A random bit of friendly trash talk, not the same one twice in a row."""
@@ -690,7 +711,7 @@ class Brain:
         # History records what Loopy actually said and did, not what the
         # model wanted to: otherwise, after a blocked "[do: ...]", the model
         # would believe it had already done it.
-        if gate.kind == "do" and gate.allowed_to_run:
+        if gate.kind == "do" and gate.allowed_to_run and gate.action:
             self.pending = None
             if not gate.spoken:
                 gate.say("Okay!")
@@ -768,6 +789,7 @@ class _Gate:
         if self.stopped:
             return
         end = len(raw)
+        assert self._body_start is not None  # set by _read_tag
         body = raw[self._body_start:]
         role, board = self._ROLE.search(body), self._FAKE_BOARD.search(body)
         cut = min([m.start() for m in (role, board) if m], default=None)

@@ -20,8 +20,32 @@ dependencies = [
     "llama-cpp-python>=0.3",
 ]
 
+[project.optional-dependencies]
+dev = ["ruff>=0.6", "mypy>=1.10"]
+
 [project.scripts]
 loopy = "loopy.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/loopy"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+# pycodestyle, pyflakes, import order, bugbear, pyupgrade, simplify
+select = ["E", "W", "F", "I", "B", "UP", "SIM"]
+ignore = [
+    "E402",   # tests set QT_QPA_PLATFORM before importing Qt, on purpose
+    "SIM105", # try/except/pass reads clearer than contextlib.suppress here
+]
+
+[tool.mypy]
+python_version = "3.10"
+files = ["src/loopy"]
+ignore_missing_imports = true   # PySide6/llama_cpp/piper/etc. ship no or partial stubs
+check_untyped_defs = true
+warn_unused_ignores = true
+no_implicit_optional = true

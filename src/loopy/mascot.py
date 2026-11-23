@@ -12,16 +12,18 @@ Public API:
 import math
 import random
 import time
+from collections.abc import Sequence
 from enum import Enum
+from typing import Protocol, runtime_checkable
 
 from PySide6.QtCore import QPoint, QPointF, QRect, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import (
     QAction,
-    QGuiApplication,
     QColor,
     QCursor,
     QFont,
     QFontMetrics,
+    QGuiApplication,
     QLinearGradient,
     QPainter,
     QPainterPath,
@@ -40,7 +42,31 @@ def system_drag(widget: QWidget) -> bool:
     return False
 
 
-def move_together(lead: QWidget, top_left: QPoint, partners: list[QWidget] = ()) -> None:
+@runtime_checkable
+class HasPartners(Protocol):
+    """A window that can move together with others (Loopy, the game boards)."""
+    partners: list[QWidget]
+
+
+def tie(window: QWidget, partner: QWidget) -> None:
+    """Make two windows move as one unit (see move_together)."""
+    if isinstance(window, HasPartners):
+        window.partners = [partner]
+    if isinstance(partner, HasPartners):
+        partner.partners = [window]
+
+
+def untie(window: QWidget) -> None:
+    """Undo tie(): both windows move on their own again."""
+    if not isinstance(window, HasPartners):
+        return
+    for partner in window.partners:
+        if isinstance(partner, HasPartners) and window in partner.partners:
+            partner.partners.remove(window)
+    window.partners = []
+
+
+def move_together(lead: QWidget, top_left: QPoint, partners: Sequence[QWidget] = ()) -> None:
     """Move `lead` to `top_left` and its visible partners by the same amount,
     so they travel as one unit, but never past the edge of the screen: the
     whole group stops at the edge (and stays above the taskbar)."""
@@ -109,9 +135,9 @@ class Mascot(QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowFlags(
-            Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool
+            Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.Tool
         )
-        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setFixedSize(WIN_W, WIN_H)
 
         # Optional callback(menu) to add app-specific items to the right-click menu.
@@ -134,7 +160,7 @@ class Mascot(QWidget):
         self._clip = _clip_path()
         self._font = QFont("Segoe UI", 10)
         self._chip_font = QFont("Segoe UI", 8)
-        self._chip_font.setWeight(QFont.DemiBold)
+        self._chip_font.setWeight(QFont.Weight.DemiBold)
 
         self._timer = QTimer(self)
         self._timer.timeout.connect(self.update)
@@ -206,7 +232,7 @@ class Mascot(QWidget):
             self._bubble_text = ""
 
         p = QPainter(self)
-        p.setRenderHint(QPainter.Antialiasing)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
 
         if self._state == State.SLEEPING:
             bob = math.sin(t * 1.1) * 1.5  # slow, shallow "breathing"
@@ -223,7 +249,7 @@ class Mascot(QWidget):
 
         # Near-invisible fill so the whole character is clickable/draggable
         # (fully transparent pixels are click-through on Windows).
-        p.setPen(Qt.NoPen)
+        p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(QColor(0, 0, 0, 2))
         p.drawEllipse(QRectF(-14, -12, 74, 165))
 
@@ -259,20 +285,20 @@ class Mascot(QWidget):
 
         p.setPen(QColor(235, 240, 248, 150 if sleeping else 240))
         text_rect = QRectF(icon.x() + icon_w / 2 + 6, rect.top(), rect.right() - pad - icon.x() - icon_w / 2 - 6, h)
-        p.drawText(text_rect, Qt.AlignVCenter | Qt.AlignLeft,
-                   fm.elidedText(self._status_text, Qt.ElideRight, int(text_rect.width())))
+        p.drawText(text_rect, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                   fm.elidedText(self._status_text, Qt.TextElideMode.ElideRight, int(text_rect.width())))
 
     def _draw_activity_icon(self, p: QPainter, c: QPointF, t: float):
         a = self._activity
-        p.setBrush(Qt.NoBrush)
+        p.setBrush(Qt.BrushStyle.NoBrush)
         if a == Activity.BUSY:                       # spinning ring
             p.setPen(QPen(QColor(255, 255, 255, 50), 2))
             p.drawEllipse(c, 5.5, 5.5)
-            p.setPen(QPen(ACCENT, 2, Qt.SolidLine, Qt.RoundCap))
+            p.setPen(QPen(ACCENT, 2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
             start = int(-t * 360 * 1.4) % 360
             p.drawArc(QRectF(c.x() - 5.5, c.y() - 5.5, 11, 11), start * 16, 110 * 16)
         elif a == Activity.SPEAKING:                 # equalizer bars
-            p.setPen(Qt.NoPen)
+            p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(ACCENT)
             for i in range(4):
                 bar = 2.5 + 7 * abs(math.sin(t * (7 + i * 1.7) + i * 1.3))
@@ -280,39 +306,39 @@ class Mascot(QWidget):
         elif a == Activity.LISTENING:                # dot that pulses with your voice
             r = 3.5 + 3.5 * self._level + 0.8 * math.sin(t * 8)
             halo = QColor(255, 90, 90, 70)
-            p.setPen(Qt.NoPen)
+            p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(halo)
             p.drawEllipse(c, r + 2.5, r + 2.5)
             p.setBrush(QColor(255, 95, 95))
             p.drawEllipse(c, r, r)
         elif a == Activity.SLEEPING:                 # dim, slow pulse
             alpha = int(70 + 50 * (0.5 + 0.5 * math.sin(t * 1.2)))
-            p.setPen(Qt.NoPen)
+            p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(QColor(160, 170, 200, alpha))
             p.drawEllipse(c, 3.5, 3.5)
         else:                                        # idle: softly breathing dot
             k = 0.5 + 0.5 * math.sin(t * 2.0)
-            p.setPen(Qt.NoPen)
+            p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(QColor(70, 210, 120, int(60 * k)))
             p.drawEllipse(c, 5.5 + k, 5.5 + k)
             p.setBrush(QColor(70, 210, 120))
             p.drawEllipse(c, 3.5, 3.5)
 
     def _draw_clip(self, p: QPainter):
-        p.setBrush(Qt.NoBrush)
-        p.setPen(QPen(OUTLINE, 7, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.setPen(QPen(OUTLINE, 7, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
         p.drawPath(self._clip)
 
         metal = QLinearGradient(0, 0, 46, 0)
         metal.setColorAt(0.0, QColor(150, 160, 178))
         metal.setColorAt(0.45, QColor(236, 241, 248))
         metal.setColorAt(1.0, QColor(130, 141, 160))
-        p.setPen(QPen(metal, 4.6, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+        p.setPen(QPen(metal, 4.6, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
         p.drawPath(self._clip)
 
         p.save()
         p.translate(-0.9, -0.9)
-        p.setPen(QPen(QColor(255, 255, 255, 140), 1.2, Qt.SolidLine, Qt.RoundCap))
+        p.setPen(QPen(QColor(255, 255, 255, 140), 1.2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
         p.drawPath(self._clip)
         p.restore()
 
@@ -326,9 +352,9 @@ class Mascot(QWidget):
         # Eyebrows
         lift = -4 if listening else 0
         brow_tilt = (-3, 1) if working else (0, 0)
-        p.setBrush(Qt.NoBrush)
-        p.setPen(QPen(OUTLINE, 2.4, Qt.SolidLine, Qt.RoundCap))
-        for cx, tilt in zip((13, 35), brow_tilt):
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.setPen(QPen(OUTLINE, 2.4, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+        for cx, tilt in zip((13, 35), brow_tilt, strict=True):
             y = 41 + lift + tilt
             brow = QPainterPath(QPointF(cx - 7, y + 1))
             brow.quadTo(cx, y - 3, cx + 7, y + 1)
@@ -345,19 +371,19 @@ class Mascot(QWidget):
         self._draw_mouth(p, t)
 
     def _draw_sleeping_face(self, p: QPainter):
-        p.setBrush(Qt.NoBrush)
-        p.setPen(QPen(OUTLINE, 2.2, Qt.SolidLine, Qt.RoundCap))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.setPen(QPen(OUTLINE, 2.2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
         for cx in (13, 35):
-            p.setPen(QPen(OUTLINE, 2.2, Qt.SolidLine, Qt.RoundCap))
-            p.setBrush(Qt.NoBrush)
+            p.setPen(QPen(OUTLINE, 2.2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+            p.setBrush(Qt.BrushStyle.NoBrush)
             brow = QPainterPath(QPointF(cx - 6, 44))       # relaxed, lower brows
             brow.quadTo(cx, 42, cx + 6, 44)
             p.drawPath(brow)
             p.setPen(QPen(OUTLINE, 1.3))                   # closed eye: white lid...
-            p.setBrush(Qt.white)
+            p.setBrush(Qt.GlobalColor.white)
             p.drawEllipse(QPointF(cx, 55), 9.5, 6.5)
-            p.setPen(QPen(OUTLINE, 2.2, Qt.SolidLine, Qt.RoundCap))
-            p.setBrush(Qt.NoBrush)
+            p.setPen(QPen(OUTLINE, 2.2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+            p.setBrush(Qt.BrushStyle.NoBrush)
             lid = QPainterPath(QPointF(cx - 7, 55.5))      # ...with a sleepy lash line
             lid.quadTo(cx, 60, cx + 7, 55.5)
             p.drawPath(lid)
@@ -379,15 +405,15 @@ class Mascot(QWidget):
 
     def _draw_eye(self, p, cx, cy, r, openness, look: QPointF):
         p.setPen(QPen(OUTLINE, 1.3))
-        p.setBrush(Qt.white)
+        p.setBrush(Qt.GlobalColor.white)
         p.drawEllipse(QPointF(cx, cy), r, max(r * openness, 0.7))
         if openness < 0.35:
             return
         px, py = cx + look.x(), cy + look.y() * openness
-        p.setPen(Qt.NoPen)
+        p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(PUPIL)
         p.drawEllipse(QPointF(px, py), 4.2, 4.2 * min(1.0, openness * 1.2))
-        p.setBrush(Qt.white)
+        p.setBrush(Qt.GlobalColor.white)
         p.drawEllipse(QPointF(px + 1.4, py - 1.4), 1.3, 1.3)
 
     def _draw_mouth(self, p: QPainter, t: float):
@@ -403,15 +429,15 @@ class Mascot(QWidget):
             p.setBrush(QColor(150, 40, 55))
             p.drawEllipse(QPointF(cx, cy), 2.4, 3.0)
         elif state == State.WORKING:
-            p.setPen(QPen(OUTLINE, 2.0, Qt.SolidLine, Qt.RoundCap))
-            p.setBrush(Qt.NoBrush)
+            p.setPen(QPen(OUTLINE, 2.0, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+            p.setBrush(Qt.BrushStyle.NoBrush)
             mouth = QPainterPath(QPointF(cx - 5, cy))
             mouth.quadTo(cx - 2, cy - 2, cx, cy)
             mouth.quadTo(cx + 2, cy + 2, cx + 5, cy)
             p.drawPath(mouth)
         else:
-            p.setPen(QPen(OUTLINE, 2.0, Qt.SolidLine, Qt.RoundCap))
-            p.setBrush(Qt.NoBrush)
+            p.setPen(QPen(OUTLINE, 2.0, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+            p.setBrush(Qt.BrushStyle.NoBrush)
             mouth = QPainterPath(QPointF(cx - 5.5, cy - 1))
             mouth.quadTo(cx, cy + 4.5, cx + 5.5, cy - 1)
             p.drawPath(mouth)
@@ -424,11 +450,11 @@ class Mascot(QWidget):
             color = QColor(ACCENT)
             color.setAlphaF(0.55 * (1 - phase))
             p.setPen(QPen(color, 2.5))
-            p.setBrush(Qt.NoBrush)
+            p.setBrush(Qt.BrushStyle.NoBrush)
             p.drawEllipse(center, radius, radius)
 
     def _draw_working_dots(self, p: QPainter, t: float):
-        p.setPen(Qt.NoPen)
+        p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(ACCENT)
         for i in range(3):
             y = 18 - abs(math.sin(t * 6 - i * 0.7)) * 5
@@ -439,7 +465,7 @@ class Mascot(QWidget):
         fm = QFontMetrics(self._font)
         inner_w = WIN_W - 44
         text_rect = fm.boundingRect(
-            QRect(0, 0, inner_w, 1000), Qt.TextWordWrap | Qt.AlignCenter,
+            QRect(0, 0, inner_w, 1000), Qt.TextFlag.TextWordWrap | Qt.AlignmentFlag.AlignCenter,
             self._bubble_text,
         )
         h = min(text_rect.height() + 20, 80)
@@ -460,14 +486,14 @@ class Mascot(QWidget):
         p.setPen(PUPIL)
         p.drawText(
             rect.adjusted(12, 8, -12, -8),
-            Qt.TextWordWrap | Qt.AlignCenter,
+            Qt.TextFlag.TextWordWrap | Qt.AlignmentFlag.AlignCenter,
             self._bubble_text,
         )
 
     # ---------------------------------------------------------- interaction
 
     def mousePressEvent(self, event):
-        if event.button() == Qt.LeftButton:
+        if event.button() == Qt.MouseButton.LeftButton:
             if system_drag(self):  # Wayland: the compositor moves the window
                 return
             self._drag_offset = (
@@ -475,7 +501,7 @@ class Mascot(QWidget):
             )
 
     def mouseMoveEvent(self, event):
-        if self._drag_offset is not None and event.buttons() & Qt.LeftButton:
+        if self._drag_offset is not None and event.buttons() & Qt.MouseButton.LeftButton:
             move_together(self, event.globalPosition().toPoint() - self._drag_offset, self.partners)
 
     def mouseReleaseEvent(self, _event):

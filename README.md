@@ -1,5 +1,10 @@
 # Loopy
 
+[![CI](https://github.com/ravishankardas/loopy/actions/workflows/ci.yml/badge.svg)](https://github.com/ravishankardas/loopy/actions/workflows/ci.yml)
+![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)
+![Ruff](https://img.shields.io/badge/lint-ruff-261230)
+![Mypy](https://img.shields.io/badge/types-mypy-2a6db2)
+
 A desktop voice assistant that runs entirely on your own computer. Loopy is a little paperclip who floats on your desktop: say **"Hey Loopy"**, talk to it naturally, and it answers out loud. It can also do things on your computer, and it always asks before it does.
 
 No cloud and no API keys. Speech recognition, the language model and the voice all run locally on your CPU. Internet is only needed once, to download the models.
@@ -154,7 +159,7 @@ git clone https://github.com/ravishankardas/loopy
 cd loopy
 python -m venv .venv
 .venv\Scripts\activate          # Windows (macOS/Linux: source .venv/bin/activate)
-pip install -e . --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu
+pip install -e ".[dev]" --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu
 loopy setup
 loopy
 ```
@@ -162,8 +167,12 @@ loopy
 ### Tests
 
 ```bash
-python -m unittest discover tests        # fast tests, under a second, no model needed
+python -m unittest discover tests        # fast tests, a few seconds, no model needed
+ruff check src tests                     # lint
+mypy                                     # type check
 ```
+
+GitHub Actions runs all three on every push: lint and type checks, plus the tests on Windows and Ubuntu (Python 3.11 and 3.12). See `.github/workflows/ci.yml`.
 
 The fast tests use a fake model that replies with scripted, misbehaving output. They check that Loopy's code still asks before every action, never speaks tags or invented "system:" lines, reports real numbers, and that checks stay read-only.
 

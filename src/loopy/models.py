@@ -6,9 +6,9 @@ user's app-data folder, e.g. %LOCALAPPDATA%\\loopy on Windows or
 """
 
 import urllib.request
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
 
 from platformdirs import user_data_path
 
