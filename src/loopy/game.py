@@ -117,6 +117,7 @@ class BoardWindow(QWidget):
         self._number = QFont("Segoe UI", 22, QFont.Bold)
         self._corner = QFont("Segoe UI", 7)
         self._drag = None
+        self.partners: list[QWidget] = []  # Loopy, while the board is open: they move together
         self.reset()
         self.status = "Your turn · you're X"
         self.scores = (0, 0, 0)
@@ -149,11 +150,23 @@ class BoardWindow(QWidget):
         self.scores = (you, draws, loopy)
 
     def open_next_to(self, widget: QWidget) -> None:
-        """Show the board just left of Loopy, bottom-aligned."""
+        """Show the board beside Loopy (left, or right if there's no room),
+        bottom-aligned, and tie the two together: dragging either moves both,
+        and neither goes past the edge of the screen."""
+        from loopy.mascot import move_together
+
         geo = widget.frameGeometry()
-        self.move(geo.left() - self.W - 8, geo.bottom() - self.H - 30)
+        screen = (widget.screen() or self.screen()).availableGeometry()
+        x = geo.left() - self.W - 8
+        if x < screen.left():                       # no room on the left: go right
+            x = geo.right() + 8
+        self.move(x, geo.bottom() - self.H - 30)
+        self.partners = [widget]
+        if hasattr(widget, "partners"):
+            widget.partners = [self]
         self._opened = time.monotonic()
         self.show()
+        move_together(self, self.pos(), self.partners)  # pull the pair on screen if needed
 
     def celebrate(self, winner: str) -> None:
         """Balloons, confetti and the winner's name ("X" = you, "O" = Loopy)."""
@@ -165,6 +178,10 @@ class BoardWindow(QWidget):
     def hide(self) -> None:
         if hasattr(self, "_party"):
             self._party.stop()
+        for partner in self.partners:  # untie: Loopy moves on its own again
+            if getattr(partner, "partners", None) is not None and self in partner.partners:
+                partner.partners.remove(self)
+        self.partners = []
         super().hide()
 
     # ------------------------------------------------------------- painting
@@ -277,7 +294,9 @@ class BoardWindow(QWidget):
 
     def mouseMoveEvent(self, event):
         if self._drag is not None and event.buttons() & Qt.LeftButton:
-            self.move(event.globalPosition().toPoint() - self._drag)
+            from loopy.mascot import move_together
+
+            move_together(self, event.globalPosition().toPoint() - self._drag, self.partners)
 
     def mouseReleaseEvent(self, _event):
         self._drag = None

@@ -82,6 +82,7 @@ class Assistant(QObject):
         self._hearing = False                # someone is talking right now
         self._brain_loaded = False
         self.brain_error = ""
+        self.start_with_game = False         # `loopy tic-tac-toe`: a game instead of hello
         self._spoken = ""                    # what the bubble shows while talking
         self.speaker = None
         self.voice: Voice | None = settings.active_voice()
@@ -226,7 +227,9 @@ class Assistant(QObject):
         self._refresh_status()
         # Only now, with the model loaded, does Loopy say hello (unless you
         # already asked something while it was loading: then it just answers).
-        if self.listener is not None and self.speaker and self.transcriber and not self._thinking:
+        if self.start_with_game and not self._thinking:
+            self.play_game()  # `loopy tic-tac-toe`: straight into a game instead of hello
+        elif self.listener is not None and self.speaker and self.transcriber and not self._thinking:
             self.say("Hi! I'm Loopy. Say hey Loopy whenever you want to chat.")
         self._keep_awake()
 
@@ -337,11 +340,18 @@ class Assistant(QObject):
 
     # ---------------------------------------------------------------- brain
 
-    def think(self, text: str) -> None:
-        """Send what the user said to the brain. Its words go straight into
-        the voice as the model writes them. Runs off the UI thread."""
+    def play_game(self) -> None:
+        """Start tic-tac-toe right away (`loopy tic-tac-toe`, or the menu)."""
+        if not self.awake:
+            self.wake_up(greet=False)
+        self.think("", new_game=True)
+
+    def think(self, text: str, new_game: bool = False) -> None:
+        """Send what the user said to the brain (or, with new_game, start a
+        game of tic-tac-toe). Its words go straight into the voice as the
+        model writes them. Runs off the UI thread."""
         text = text.strip()
-        if not text:
+        if not text and not new_game:
             return
         if self.brain is None:
             self.mascot.set_state(State.IDLE)
@@ -350,7 +360,7 @@ class Assistant(QObject):
         self._busy()
         self._thinking = True
         self.mascot.set_state(State.WORKING)
-        self.mascot.show_bubble(f'"{text}"', None)  # what Loopy heard
+        self.mascot.show_bubble("Tic-tac-toe time!" if new_game else f'"{text}"', None)  # what Loopy heard
         self._refresh_status()
 
         stream = self._open_speech() if self.speaker else None
@@ -380,7 +390,10 @@ class Assistant(QObject):
 
         def work():
             try:
-                turn = self.brain.respond(text, on_text=out, on_event=on_event)
+                if new_game:
+                    turn = self.brain.new_game(on_text=out, on_event=on_event)
+                else:
+                    turn = self.brain.respond(text, on_text=out, on_event=on_event)
                 if turn.result is not None and not turn.result.ok:
                     out(f" {turn.result.message}")  # e.g. "Chrome isn't open."
                 end_line()
@@ -455,6 +468,8 @@ class Assistant(QObject):
 
     def _extend_menu(self, menu: QMenu) -> None:
         menu.addAction("Type to Loopy...", self._ask_by_typing)
+        if self._brain_loaded and not self._game_on and not self._thinking:
+            menu.addAction("Play tic-tac-toe", self.play_game)
         if self.awake:
             menu.addAction("Go to sleep", self.go_to_sleep)
         else:
@@ -659,7 +674,9 @@ def _quit_on_ctrl_c(app: QApplication) -> QTimer:
     return wake_timer  # caller must keep a reference
 
 
-def run() -> int:
+def run(start_with_game: bool = False) -> int:
+    """Start Loopy. With start_with_game (`loopy tic-tac-toe`), it jumps
+    straight into a game once its brain has loaded, instead of saying hello."""
     # The Windows console can't encode some characters a model may write
     # (curly quotes, accents...); print a "?" instead of crashing.
     for s in (sys.stdout, sys.stderr):
@@ -673,6 +690,7 @@ def run() -> int:
     app = QApplication(sys.argv)
     mascot = Mascot()
     assistant = Assistant(mascot)
+    assistant.start_with_game = start_with_game  # read once the brain is ready (inside app.exec)
     app.aboutToQuit.connect(assistant.shutdown)
     _wake = _quit_on_ctrl_c(app)
     mascot.show()

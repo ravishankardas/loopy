@@ -156,6 +156,51 @@ class StartingAndStopping(GameTest):
         self.assertEqual(self.brain.scores["you"], 1)
 
 
+class StartingWithoutAsking(GameTest):
+    """`loopy tic-tac-toe` and the menu start a game without a spoken request."""
+
+    def new_game(self, *model_replies):
+        self.fake = FakeLlama(*model_replies)
+        self.brain._llm = self.fake
+        said, events = [], []
+        self.brain.new_game(said.append, lambda *e: events.append(e))
+        return "".join(said).strip(), events
+
+    def test_new_game_opens_the_board_and_you_go_first(self):
+        said, events = self.new_game()
+        self.assertEqual(events, [("start", False)])
+        self.assertIn("Yay, let's play!", said)
+        self.assertIn("You go first", said)
+        self.assertEqual(self.fake.calls, [])          # no model call needed to start
+
+    def test_the_model_knows_a_game_is_on(self):
+        self.new_game()
+        roles = [(m["role"], m["content"][:30]) for m in self.brain._history]
+        self.assertEqual(roles[0], ("user", "Let's play tic-tac-toe!"))
+        self.assertTrue(any("game started" in c.lower() for _r, c in roles))
+
+    def test_then_moves_work_as_usual(self):
+        self.new_game()
+        said, events = self.turn("put a cross in 5", "[move: 5]", "[play: 1] Corner!")
+        self.assertIn(("place", 5, "X"), events)
+        self.assertIn(("place", 1, "O"), events)
+
+
+class Command(unittest.TestCase):
+    def test_loopy_tic_tac_toe_starts_with_a_game(self):
+        from loopy import cli
+        for command in ("tic-tac-toe", "ttt"):
+            with mock.patch("loopy.app.run", return_value=0) as run:
+                cli.main([command])
+            run.assert_called_once_with(start_with_game=True)
+
+    def test_plain_loopy_says_hello_instead(self):
+        from loopy import cli
+        with mock.patch("loopy.app.run", return_value=0) as run:
+            cli.main([])
+        run.assert_called_once_with(start_with_game=False)
+
+
 class Moves(GameTest):
     def test_your_move_then_loopys_move(self):
         self.start()

@@ -1,6 +1,7 @@
 """The `loopy` command.
 
     loopy                     start the assistant
+    loopy tic-tac-toe         start the assistant straight into a game of tic-tac-toe
     loopy setup               download the models (run once after pip install)
     loopy setup --voice ID    download a specific voice
     loopy voices              list available voices
@@ -18,6 +19,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="loopy", description="Local desktop voice assistant.")
     sub = parser.add_subparsers(dest="command")
     sub.add_parser("run", help="start Loopy (the default)")
+    sub.add_parser("tic-tac-toe", aliases=["ttt"], help="start Loopy straight into a game of tic-tac-toe")
     setup = sub.add_parser("setup", help="download the models Loopy needs")
     setup.add_argument("--voice", help="voice id to download and use (see 'loopy voices')")
     setup.add_argument("--force", action="store_true", help="re-download even if already installed")
@@ -46,7 +48,7 @@ def main(argv: list[str] | None = None) -> int:
 
     from loopy.app import run
 
-    return run()
+    return run(start_with_game=args.command in ("tic-tac-toe", "ttt"))
 
 
 def _setup(voice_id: str | None, force: bool) -> int:

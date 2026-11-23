@@ -362,6 +362,23 @@ class Brain:
 
     # ---------------------------------------------------------- tic-tac-toe
 
+    def new_game(self, on_text: TextOut, on_event: GameEvent | None = None) -> Turn:
+        """Start a tic-tac-toe game without being asked in words (the
+        `loopy tic-tac-toe` command, or the right-click menu)."""
+        llm = self.load()
+        with self._lock:
+            self._said = []
+            self._on_text = on_text
+            self._on_event = on_event or (lambda *_e: None)
+            self._trim(llm)
+            self.pending = None
+            # Recorded as if asked, so the model knows why a board is open.
+            self._history.append({"role": "user", "content": "Let's play tic-tac-toe!"})
+            self._say("Yay, let's play!")
+            self._remember("game: start", "Yay, let's play!")
+            self._start_game(llm, announce=True)
+            return Turn("".join(self._said).strip())
+
     def _game_turn(self, llm, gate: "_Gate") -> None:
         if gate.kind == "game":
             if gate.game_cmd == "stop":

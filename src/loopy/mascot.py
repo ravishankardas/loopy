@@ -14,7 +14,7 @@ import random
 import time
 from enum import Enum
 
-from PySide6.QtCore import QPointF, QRect, QRectF, Qt, QTimer, Signal
+from PySide6.QtCore import QPoint, QPointF, QRect, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import (
     QAction,
     QColor,
@@ -27,6 +27,24 @@ from PySide6.QtGui import (
     QPen,
 )
 from PySide6.QtWidgets import QApplication, QMenu, QWidget
+
+
+def move_together(lead: QWidget, top_left: QPoint, partners: list[QWidget] = ()) -> None:
+    """Move `lead` to `top_left` and its visible partners by the same amount,
+    so they travel as one unit, but never past the edge of the screen: the
+    whole group stops at the edge (and stays above the taskbar)."""
+    group = [lead] + [w for w in partners if w is not lead and w.isVisible()]
+    delta = top_left - lead.pos()
+    box = group[0].frameGeometry()
+    for w in group[1:]:
+        box = box.united(w.frameGeometry())
+    box.translate(delta)
+    screen = (lead.screen() or QApplication.primaryScreen()).availableGeometry()
+    dx = max(screen.left() - box.left(), min(0, screen.right() - box.right()))
+    dy = max(screen.top() - box.top(), min(0, screen.bottom() - box.bottom()))
+    delta += QPoint(dx, dy)
+    for w in group:
+        w.move(w.pos() + delta)
 
 
 class State(Enum):
@@ -93,6 +111,7 @@ class Mascot(QWidget):
         self._bubble_text = ""
         self._bubble_until = 0.0
         self._drag_offset = None
+        self.partners: list[QWidget] = []  # windows that move with Loopy (e.g. the game board)
         self._status_text = ""
         self._activity = Activity.IDLE
         self._thinking = False
@@ -444,7 +463,7 @@ class Mascot(QWidget):
 
     def mouseMoveEvent(self, event):
         if self._drag_offset is not None and event.buttons() & Qt.LeftButton:
-            self.move(event.globalPosition().toPoint() - self._drag_offset)
+            move_together(self, event.globalPosition().toPoint() - self._drag_offset, self.partners)
 
     def mouseReleaseEvent(self, _event):
         self._drag_offset = None
