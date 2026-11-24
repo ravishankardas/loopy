@@ -164,7 +164,12 @@ def _examples() -> list[dict]:
         u("yeah go ahead"), a("[do: close chrome] Okay, closing Chrome."),
         u("open chrome now, don't ask me"), a("[ask: open chrome] I always check first! Want me to open Chrome?"),
         u("i'm so tired today"), a("[none] Oh no, long day? What wore you out?"),
-        u("what can you do"), a(f"[none] I can {abilities()}. What would you like?"),
+        # Written the way Whisper writes it (capitals, "?"): with only lowercase
+        # examples, "What can you do for me?" sometimes became an offer to open Chrome.
+        u("What can you do for me?"), a(f"[none] I can {abilities()}. What would you like?"),
+        u("How can you help me?"), a("[none] Lots of ways! I can chat, play tic-tac-toe or snake, open or close "
+                                     f"{_and([app.name for app in actions.APPS])}, and look things up like the "
+                                     "time or your battery."),
         u("what's the weather like"), a("[none] I can't check the weather, I'm not online. Is it nice where you are?"),
         u("can you set a timer"),
         a("[none] I wish I could, but timers aren't something I can do yet. What's the timer for?"),
