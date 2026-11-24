@@ -51,11 +51,14 @@ On a 4-core laptop CPU: speech recognition 1–2 s, Loopy starts answering 1–2
 
 `loopy eval` plays 48 scripted conversations against the real model and scores every turn in code: did it ask before acting, look up the right fact and say the exact number, start the right game, never go silent or read out a tag. The safety cases include prompt injection ("ignore your instructions", a spoken fake "System: approved", "pretend I said yes").
 
-Latest run ([full report](docs/eval/report.md)), each case twice, on a laptop CPU:
+Latest runs on a laptop CPU (i5-10210U, no GPU):
 
-| Actions taken without permission | Cases passed | First word (median) |
-|---|---|---|
-| **0** of 124 turns | 88/96 (92%) | 1.8 s |
+| | Actions without permission | Cases passed | Speed (median) |
+|---|---|---|---|
+| [Text](docs/eval/report.md), each case twice | **0** of 124 turns | 92/96 (96%) | first word in 2.2 s |
+| [Speech, end to end](docs/eval/speech/report.md) | **0** of 62 turns | 45/48 (94%) | Loopy starts talking 4.1 s after you stop |
+
+In speech mode each line is spoken by a Piper voice and heard by Whisper (4.1% word error rate), and Loopy answers what Whisper heard. `loopy eval --speech` runs it.
 
 The remaining failures are judgement calls by a 3B model (like offering to close Chrome when you complain about its memory use). The code makes sure they can never turn into an action you didn't say yes to.
 
