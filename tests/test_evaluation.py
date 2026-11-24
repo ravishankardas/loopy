@@ -149,6 +149,80 @@ class RunningCases(unittest.TestCase):
         self.assertFalse(result.unsafe)
 
 
+class FakeVoice:
+    """Stands in for PiperVoice: 0.1 s of audio per word, at Piper's rate."""
+    sample_rate = 22_050
+
+    def __init__(self):
+        self.said: list[str] = []
+
+    def synthesize(self, text):
+        from types import SimpleNamespace
+
+        import numpy as np
+        self.said.append(text)
+        for _word in text.split():
+            yield SimpleNamespace(audio_float_array=np.zeros(2205, dtype=np.float32), sample_rate=self.sample_rate)
+
+
+class FakeWhisper:
+    """Stands in for stt.Transcriber: 'hears' scripted text."""
+
+    def __init__(self, *heard: str):
+        self.heard = list(heard)
+        self.audio_lengths: list[int] = []
+
+    def transcribe(self, audio) -> str:
+        self.audio_lengths.append(len(audio))
+        return self.heard.pop(0)
+
+
+class Speech(unittest.TestCase):
+    def test_word_errors(self):
+        we = evaluation.word_errors
+        self.assertEqual(we("Close Chrome.", "close chrome"), 0)           # case and punctuation don't count
+        self.assertEqual(we("Let's play tic-tac-toe.", "Let's play tic tac toe!"), 0)
+        self.assertEqual(we("Close Chrome.", "Close crow."), 1)            # substitution
+        self.assertEqual(we("Open Chrome please.", "Open Chrome."), 1)     # missing word
+        self.assertEqual(we("Yes.", "Yes yes yes."), 2)                    # extra words
+        self.assertEqual(we("Hi there.", ""), 2)
+
+    def test_resample_to_16k(self):
+        import numpy as np
+        audio = evaluation.resample(np.zeros(22_050, dtype=np.float32), 22_050)
+        self.assertEqual(len(audio), 16_000)
+        self.assertEqual(audio.dtype, np.float32)
+
+    def test_a_case_answers_what_whisper_heard(self):
+        brain = Brain("unused.gguf")
+        brain._llm = FakeLlama("[ask: close chrome] Want me to close Chrome?")
+        user, loopy = FakeVoice(), FakeVoice()
+        rig = evaluation.SpeechRig(user, FakeWhisper("Close crow."), loopy)
+        case = Case("c", "intent", "", [("Close Chrome.", Expect(asks="close chrome"))])
+        t = evaluation.run_case(brain, case, speech=rig).turns[0]
+        self.assertEqual(user.said, ["Close Chrome."])                    # the user's line was spoken...
+        self.assertEqual(t.heard, "Close crow.")                          # ...and the model got what was heard
+        self.assertEqual(brain._llm.calls[0][-1]["content"], "Close crow.")
+        self.assertEqual(t.word_errors, 1)
+        self.assertIsNotNone(t.stt_s)
+        self.assertIsNotNone(t.first_audio_s)                             # Loopy's reply was voiced
+        self.assertEqual(loopy.said, ["Want me to close Chrome?"])
+        self.assertEqual(t.failures, [])
+
+    def test_report_has_a_speech_section(self):
+        out = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, out, ignore_errors=True)
+        t = record()
+        t.heard, t.word_errors, t.stt_s, t.first_audio_s = "Close crow.", 1, 0.8, 1.5
+        t.user = "Close Chrome."
+        r = evaluation.CaseResult("c", "intent", "", 1, [t])
+        text = evaluation.write_report([r], out, {"repeat": 1}).read_text(encoding="utf-8")
+        self.assertIn("## Speech, end to end", text)
+        self.assertIn("word error rate: **50.0%**", text)                 # 1 of 2 words
+        self.assertIn("| ...Loopy starting to talk | **3.0 s** |", text)  # 0.7 + 0.8 + 1.5
+        self.assertIn("| Close Chrome. | Close crow. |", text)
+
+
 class Report(unittest.TestCase):
     def test_writes_markdown_and_json(self):
         out = Path(tempfile.mkdtemp())

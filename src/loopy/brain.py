@@ -114,7 +114,7 @@ If asked for something you can't do, say so kindly and stay in the conversation.
 When asked what you can do (or how you can help), tell them all of it: you can {abilities()}.
 
 You can play tic-tac-toe with the user on a board that appears on screen (no permission needed).
-Speech recognition often mishears it ("tiktok toe", "tick tock toe", "tic tac"). When they want to play, reply with [game: start]
+Speech recognition often mishears it ("tiktok toe", "tick tock toe", "tic-tock-toe", "tic tac"). When they want to play, reply with [game: start]
 and the real board appears. Never draw a board in text and never play a game in words yourself.
 Cells are numbered 1 to 9: 1 top-left, 2 top-middle, 3 top-right, 4 middle-left, 5 center, 6 middle-right,
 7 bottom-left, 8 bottom-middle, 9 bottom-right. The user is X, you are O. When you name a cell in a comment, use these names.
@@ -405,10 +405,12 @@ class Brain:
             elif checked:
                 # It looked something up but answered vaguely ("pretty busy"):
                 # add the real numbers it left out.
+                # The first number is the headline (the battery's 57%, the hour):
+                # saying only a lesser one ("2 hours 10 minutes left") isn't enough
+                # (found by `loopy eval --speech`).
                 for _name, value in checked:
                     numbers = re.findall(r"\d+(?:\.\d+)?", value)
-                    said = any(re.search(rf"(?<![\d.]){re.escape(n)}(?![\d.])", gate.spoken) for n in numbers)
-                    if numbers and not said:
+                    if numbers and not re.search(rf"(?<![\d.]){re.escape(numbers[0])}(?![\d.])", gate.spoken):
                         gate.say(f"To be exact: {value}.")
 
             if gate.fake_board and gate.kind == "none" and (self.game is None or self.game.over):

@@ -16,6 +16,8 @@ touched, and lookups return fixed values, so the expected numbers are known.
     loopy eval                  # all cases once, report in ./eval-report
     loopy eval --repeat 3       # each case 3 times (the model samples, so results vary)
     loopy eval --only safety    # one category
+    loopy eval --speech         # end to end: each line is spoken (Piper), heard
+                                # (Whisper) and answered out loud (Piper)
 """
 
 from __future__ import annotations
@@ -23,6 +25,7 @@ from __future__ import annotations
 import json
 import re
 import statistics
+import threading
 import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -102,6 +105,11 @@ class TurnRecord:
     total_s: float
     failures: list[str] = field(default_factory=list)
     unsafe: bool = False                  # an action ran that the case didn't expect
+    # Speech mode only (see SpeechRig):
+    heard: str | None = None              # what Whisper heard (the model answered this)
+    word_errors: int | None = None        # words Whisper got wrong (substituted/missing/extra)
+    stt_s: float | None = None            # Whisper's time
+    first_audio_s: float | None = None    # reply: text in -> first audio ready (model + Piper)
 
 
 def score_turn(t: TurnRecord, e: Expect) -> None:
@@ -163,6 +171,105 @@ class CaseResult:
         return any(t.unsafe for t in self.turns)
 
 
+# ------------------------------------------------------------------ speech
+
+END_OF_SPEECH_S = 0.7   # Loopy waits this long after you stop, to be sure you're done (listener.END_FRAMES)
+_WORD = re.compile(r"[a-z0-9']+")
+
+
+def words(text: str) -> list[str]:
+    """Lowercase words, no punctuation: what's compared for word errors."""
+    return _WORD.findall(text.lower().replace("-", " "))
+
+
+def word_errors(said: str, heard: str) -> int:
+    """Word-level edit distance (substitutions + deletions + insertions).
+    Divided by the number of words said, this is the word error rate."""
+    ref, hyp = words(said), words(heard)
+    row = list(range(len(hyp) + 1))
+    for i, r in enumerate(ref, 1):
+        prev, row[0] = row[0], i
+        for j, h in enumerate(hyp, 1):
+            prev, row[j] = row[j], min(row[j] + 1, row[j - 1] + 1, prev + (r != h))
+    return row[-1]
+
+
+def resample(audio, rate: int, to: int = 16_000):
+    """Linear resampling, e.g. Piper's 22,050 Hz to Whisper's 16,000 Hz."""
+    import numpy as np
+    if rate == to or len(audio) == 0:
+        return audio.astype(np.float32)
+    n = int(round(len(audio) * to / rate))
+    return np.interp(np.linspace(0, len(audio) - 1, n), np.arange(len(audio)), audio).astype(np.float32)
+
+
+class SpeechRig:
+    """Real speech around the brain: the user's line is spoken by one Piper
+    voice and heard by Whisper; Loopy's reply goes through the app's own
+    streaming logic (tts.SpeechStream) and is spoken by Loopy's voice."""
+
+    def __init__(self, user_voice, transcriber, loopy_voice):
+        self.user_voice = user_voice      # PiperVoice: plays the user
+        self.transcriber = transcriber    # stt.Transcriber
+        self.loopy_voice = loopy_voice    # PiperVoice: Loopy
+
+    def hear(self, text: str) -> tuple[str, float]:
+        """Speak `text`, then transcribe it: (what Whisper heard, seconds)."""
+        import numpy as np
+        pieces, rate = [], 16_000
+        for chunk in self.user_voice.synthesize(text):
+            pieces.append(chunk.audio_float_array)
+            rate = chunk.sample_rate
+        pad = np.zeros(int(0.3 * rate), dtype=np.float32)       # a moment of silence around it
+        audio = resample(np.concatenate([pad, *pieces, pad]), rate)
+        started = time.perf_counter()
+        heard = self.transcriber.transcribe(audio)
+        return heard, time.perf_counter() - started
+
+    def speak(self, started: float):
+        """A SpeechStream to feed the reply into, and a function that returns
+        when its first audio was ready (seconds after `started`), like the
+        app: the first phrase is synthesized while the model is still writing."""
+        from loopy.tts import SpeechStream
+        stream = SpeechStream()
+        ready: list[float] = []
+
+        def voice() -> None:
+            text = stream.take(first=True)
+            if text is None:
+                return
+            for _chunk in self.loopy_voice.synthesize(text):
+                ready.append(time.perf_counter() - started)
+                break
+
+        worker = threading.Thread(target=voice, daemon=True)
+        worker.start()
+
+        def finish() -> float | None:
+            stream.close()
+            worker.join(60)
+            return ready[0] if ready else None
+
+        return stream, finish
+
+
+def load_speech_rig() -> SpeechRig:
+    """The installed models: Loopy's voice, a different installed voice for
+    the user (so Whisper isn't hearing Loopy talk to itself), and Whisper."""
+    from piper import PiperVoice
+
+    from loopy import models, settings
+    from loopy.stt import Transcriber
+    loopy = settings.active_voice()
+    if loopy is None or not models.stt_installed():
+        raise RuntimeError("Speech mode needs a voice and Whisper. Run: loopy setup")
+    others = [v for v in models.VOICES if v.installed and v.id != loopy.id]
+    user = others[0] if others else loopy
+    transcriber = Transcriber(models.stt_path())
+    transcriber.load()
+    return SpeechRig(PiperVoice.load(user.path), transcriber, PiperVoice.load(loopy.path))
+
+
 # ----------------------------------------------------------------- running
 
 @contextmanager
@@ -182,8 +289,10 @@ def _sandbox(ran: list[str]) -> Iterator[None]:
         actions.run, checks.read = real_run, real_read
 
 
-def run_case(brain, case: Case, run: int = 1) -> CaseResult:
-    """Play one case from a clean slate and score every turn."""
+def run_case(brain, case: Case, run: int = 1, speech: SpeechRig | None = None) -> CaseResult:
+    """Play one case from a clean slate and score every turn. With `speech`,
+    each line is spoken and heard first, and the model answers what Whisper
+    heard (so mishearings count, like in real use)."""
     brain.reset()
     brain._loopy_starts_next = False   # the user moves first in tic-tac-toe cases
     records = []
@@ -192,34 +301,44 @@ def run_case(brain, case: Case, run: int = 1) -> CaseResult:
         events: list[str] = []
         pieces: list[str] = []
         first: list[float] = []
+        heard, stt_s = speech.hear(user) if speech else (user, None)
         started = time.perf_counter()
+        stream, first_audio = speech.speak(started) if speech else (None, None)
 
-        def on_text(piece: str, pieces=pieces, first=first, started=started) -> None:
+        def on_text(piece: str, pieces=pieces, first=first, started=started, stream=stream) -> None:
             if piece.strip() and not first:
                 first.append(time.perf_counter() - started)
             pieces.append(piece)
+            if stream is not None:
+                stream.feed(piece)
 
         def on_event(kind: str, *args, events=events) -> None:
             events.append(f"place:{args[1]}" if kind == "place" else kind)
 
         with _sandbox(ran):
-            turn = brain.respond(user, on_text, on_event)
+            turn = brain.respond(heard, on_text, on_event)
+        total_s = time.perf_counter() - started
         record = TurnRecord(
             user=user, reply="".join(pieces).strip(), asked=brain.pending, ran=ran,
             checked=[name for name, _ in turn.checked], events=events,
-            first_word_s=first[0] if first else None, total_s=time.perf_counter() - started,
+            first_word_s=first[0] if first else None, total_s=total_s,
         )
+        if speech and first_audio:
+            record.heard, record.stt_s = heard, stt_s
+            record.word_errors = word_errors(user, heard)
+            record.first_audio_s = first_audio()
         score_turn(record, expect)
         records.append(record)
     return CaseResult(case.id, case.category, case.about, run, records)
 
 
 def run_eval(brain, cases: list[Case], repeat: int = 1,
-             progress: Callable[[CaseResult], None] | None = None) -> list[CaseResult]:
+             progress: Callable[[CaseResult], None] | None = None,
+             speech: SpeechRig | None = None) -> list[CaseResult]:
     results = []
     for run in range(1, repeat + 1):
         for case in cases:
-            result = run_case(brain, case, run)
+            result = run_case(brain, case, run, speech)
             results.append(result)
             if progress:
                 progress(result)
@@ -255,6 +374,26 @@ def summary(results: list[CaseResult]) -> dict:
         "categories": {c: {"cases": len(rs), "passed": sum(r.passed for r in rs)} for c, rs in by_category.items()},
         "first_word_s": [t.first_word_s for t in turns if t.first_word_s is not None],
         "total_s": [t.total_s for t in turns],
+        "speech": _speech_summary(turns),
+    }
+
+
+def _speech_summary(turns: list[TurnRecord]) -> dict | None:
+    spoken = [t for t in turns if t.heard is not None]
+    if not spoken:
+        return None
+    said = sum(len(words(t.user)) for t in spoken)
+    errors = sum(t.word_errors or 0 for t in spoken)
+    stt = [t.stt_s for t in spoken if t.stt_s is not None]
+    reply = [t.first_audio_s for t in spoken if t.first_audio_s is not None]
+    end_to_end = [END_OF_SPEECH_S + (t.stt_s or 0) + t.first_audio_s
+                  for t in spoken if t.first_audio_s is not None]
+    return {
+        "utterances": len(spoken),
+        "word_error_rate": errors / said if said else 0.0,
+        "heard_exactly": sum(t.word_errors == 0 for t in spoken),
+        "stt_s": stt, "reply_audio_s": reply, "end_to_end_s": end_to_end,
+        "misheard": sorted({(t.user, t.heard or "") for t in spoken if t.word_errors}),
     }
 
 
@@ -266,7 +405,7 @@ def write_report(results: list[CaseResult], out_dir: Path, meta: dict) -> Path:
     lines = [
         "# Loopy evaluation",
         "",
-        f"{meta.get('model', '')} · {meta.get('date', '')} · "
+        f"{meta.get('model', '')} · {meta.get('date', '')} · code {meta.get('commit', 'unknown')} · "
         f"{s['cases']} conversations, {s['turns']} turns{repeated}",
         "",
         "| | Result |",
@@ -297,6 +436,37 @@ def write_report(results: list[CaseResult], out_dir: Path, meta: dict) -> Path:
         f"| Whole reply | {total_med} | {total_p90} |",
         "",
     ]
+    if sp := s["speech"]:
+        e2e_med, e2e_p90 = _seconds(sp["end_to_end_s"])
+        stt_med, stt_p90 = _seconds(sp["stt_s"])
+        reply_med, reply_p90 = _seconds(sp["reply_audio_s"])
+        lines += [
+            "## Speech, end to end",
+            "",
+            "Each line was spoken by a Piper voice and heard by Whisper (Loopy answered what Whisper heard); "
+            "the reply went through the app's streaming text-to-speech in Loopy's voice.",
+            "",
+            f"Whisper word error rate: **{100 * sp['word_error_rate']:.1f}%** "
+            f"({sp['heard_exactly']}/{sp['utterances']} lines heard exactly).",
+            "",
+            "| From you stopping talking to... | Median | 90th percentile |",
+            "|---|---|---|",
+            f"| ...Loopy starting to talk | **{e2e_med}** | **{e2e_p90}** |",
+            "",
+            "Where that time goes:",
+            "",
+            "| Step | Median | 90th percentile |",
+            "|---|---|---|",
+            f"| Waiting to be sure you've finished | {END_OF_SPEECH_S:.1f} s | {END_OF_SPEECH_S:.1f} s |",
+            f"| Speech to text (Whisper) | {stt_med} | {stt_p90} |",
+            f"| First phrase written and voiced (Llama + Piper) | {reply_med} | {reply_p90} |",
+            "",
+        ]
+        if sp["misheard"]:
+            lines += ["Misheard lines:", "", "| Said | Whisper heard |", "|---|---|"]
+            lines += [f"| {said} | {heard or '(nothing)'} |" for said, heard in sp["misheard"]]
+            lines.append("")
+
     failed = [r for r in results if not r.passed]
     lines += ["## Failures", ""]
     if not failed:
@@ -306,7 +476,8 @@ def write_report(results: list[CaseResult], out_dir: Path, meta: dict) -> Path:
         lines.append(f"**{r.id}**{run}: {r.about}")
         lines.append("")
         for t in r.turns:
-            lines.append(f"- You: {t.user}")
+            heard = f" (heard: {t.heard})" if t.heard is not None and t.word_errors else ""
+            lines.append(f"- You: {t.user}{heard}")
             lines.append(f"  - Loopy: {t.reply or '(silence)'}")
             for f in t.failures:
                 lines.append(f"  - ✗ {f}")
@@ -315,7 +486,8 @@ def write_report(results: list[CaseResult], out_dir: Path, meta: dict) -> Path:
     report.write_text("\n".join(lines) + "\n", encoding="utf-8")
     (out_dir / "results.json").write_text(json.dumps({
         "meta": meta,
-        "summary": {k: v for k, v in s.items() if k not in ("first_word_s", "total_s")},
+        "summary": {k: v for k, v in s.items() if k not in ("first_word_s", "total_s", "speech")},
+        "speech": {k: v for k, v in (s["speech"] or {}).items() if not k.endswith("_s")} or None,
         "results": [{**asdict(r), "passed": r.passed} for r in results],
     }, indent=2), encoding="utf-8")
     return report
@@ -342,12 +514,27 @@ def cpu_name() -> str:
     return " ".join(name.split())
 
 
+def git_commit() -> str:
+    """The code version being measured, e.g. "cabe4b3" ("cabe4b3+changes" if edited)."""
+    import subprocess
+    try:
+        here = Path(__file__).parent
+        sha = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=here, capture_output=True,
+                             text=True, timeout=5).stdout.strip()
+        dirty = subprocess.run(["git", "status", "--porcelain", "--", "."], cwd=here, capture_output=True,
+                               text=True, timeout=5).stdout.strip()
+        return f"{sha}+changes" if sha and dirty else sha or "unknown"
+    except Exception:
+        return "unknown"
+
+
 def default_meta(repeat: int) -> dict:
     import os
 
     from loopy import models
     return {
         "model": models.LLM_NAME,
+        "commit": git_commit(),
         "date": datetime.now().strftime("%Y-%m-%d"),
         "repeat": repeat,
         "machine": f"{cpu_name()}, {os.cpu_count()} threads, no GPU",

@@ -39,6 +39,8 @@ def main(argv: list[str] | None = None) -> int:
     ev.add_argument("--repeat", type=int, default=1, help="run each case this many times (the model samples)")
     ev.add_argument("--only", help="only this category (safety, intent, facts, games, chat) or case id prefix")
     ev.add_argument("--out", default="eval-report", help="folder for report.md and results.json")
+    ev.add_argument("--speech", action="store_true",
+                    help="end to end: speak each line (Piper), hear it (Whisper), voice the reply")
     args = parser.parse_args(argv)
 
     if args.command == "setup":
@@ -56,7 +58,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "knock-test":
         return _knock_test()
     if args.command == "eval":
-        return _eval(args.repeat, args.only, args.out)
+        return _eval(args.repeat, args.only, args.out, args.speech)
 
     from loopy.app import run
 
@@ -90,7 +92,7 @@ def _rebuild() -> int:
     return 0
 
 
-def _eval(repeat: int, only: str | None, out: str) -> int:
+def _eval(repeat: int, only: str | None, out: str, speech: bool = False) -> int:
     """Run the evaluation cases against the real model and write a report."""
     from pathlib import Path
 
@@ -111,16 +113,25 @@ def _eval(repeat: int, only: str | None, out: str) -> int:
           "Actions are simulated: nothing on your computer is touched.\n", flush=True)
     brain = Brain(models.llm_path())
     brain.load()
+    rig = None
+    if speech:
+        try:
+            rig = evaluation.load_speech_rig()
+        except RuntimeError as exc:
+            print(exc)
+            return 1
 
     def progress(r: evaluation.CaseResult) -> None:
         mark = "UNSAFE" if r.unsafe else ("pass" if r.passed else "FAIL")
-        print(f"  {mark:6} {r.id}", flush=True)
+        heard = [f"heard {t.heard!r}" for t in r.turns if t.heard is not None and t.word_errors]
+        print(f"  {mark:6} {r.id}" + (f"   ({'; '.join(heard)})" if heard else ""), flush=True)
         for t in r.turns:
             for f in t.failures:
                 print(f"           {f}", flush=True)
 
-    results = evaluation.run_eval(brain, cases, repeat, progress)
-    report = evaluation.write_report(results, Path(out), evaluation.default_meta(repeat))
+    results = evaluation.run_eval(brain, cases, repeat, progress, speech=rig)
+    meta = {**evaluation.default_meta(repeat), "speech": speech}
+    report = evaluation.write_report(results, Path(out), meta)
     s = evaluation.summary(results)
     print(f"\nPassed {s['passed']}/{s['cases']}. Actions without permission: {s['unsafe_turns']}.")
     print(f"Report: {report}")

@@ -239,6 +239,19 @@ class FactsAreLookedUpNotGuessed(BrainTest):
         turn, said = self.turn("what time is it", "[check: time]", "[none]", "[none] It's 9:40 PM.")
         self.assertEqual(said, "It's 9:40 PM.")
 
+    def test_the_headline_number_must_be_said(self):
+        # Found by `loopy eval --speech`: "How's my battery?" -> "You're still on
+        # battery, with about 2 hours 10 minutes left." (the 57% left out).
+        with mock.patch.object(checks, "read", lambda name: "57%, on battery, about 2 hours 10 minutes left"):
+            turn, said = self.turn("how's my battery", "[check: battery]",
+                                   "[none] You're still on battery, with about 2 hours 10 minutes left.")
+        self.assertIn("57%", said)
+
+    def test_headline_said_is_enough(self):
+        with mock.patch.object(checks, "read", lambda name: "57%, on battery, about 2 hours 10 minutes left"):
+            turn, said = self.turn("how's my battery", "[check: battery]", "[none] You're at 57%.")
+        self.assertEqual(said, "You're at 57%.")
+
     def test_precise_answer_isnt_repeated(self):
         turn, said = self.turn("how busy is my CPU", "[check: system]",
                                "[none] Your CPU is at 20% and memory is 86% used.")
