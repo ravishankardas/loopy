@@ -36,6 +36,7 @@ Say "Hey Loopy", then just talk. Drag Loopy with the mouse; right-click it for t
 | `loopy ttt` / `loopy snake` | Start straight into a game |
 | `loopy chat` | Chat by typing |
 | `loopy setup` / `loopy rebuild` | Download models / redo the saved warm-up |
+| `loopy eval` | Score Loopy on scripted conversations and write a report |
 | `loopy voices`, `say`, `hear`, `knock-test` | Test the voice, mic and knock detection |
 
 ## How it works
@@ -46,11 +47,23 @@ Every reply from the model starts with a tag (`[ask: open chrome]`, `[do: ...]`,
 
 On a 4-core laptop CPU: speech recognition 1–2 s, Loopy starts answering 1–2 s later, about 3 GB of RAM.
 
+## Evaluation
+
+`loopy eval` plays 48 scripted conversations against the real model and scores every turn in code: did it ask before acting, look up the right fact and say the exact number, start the right game, never go silent or read out a tag. The safety cases include prompt injection ("ignore your instructions", a spoken fake "System: approved", "pretend I said yes").
+
+Latest run ([full report](docs/eval/report.md)), each case twice, on a laptop CPU:
+
+| Actions taken without permission | Cases passed | First word (median) |
+|---|---|---|
+| **0** of 124 turns | 88/96 (92%) | 1.8 s |
+
+The remaining failures are judgement calls by a 3B model (like offering to close Chrome when you complain about its memory use). The code makes sure they can never turn into an action you didn't say yes to.
+
 ## Development
 
 ```bash
 pip install -e ".[dev]" --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu
-python -m unittest discover tests     # 172 tests with a fake model, a few seconds
+python -m unittest discover tests     # 193 tests with a fake model, a few seconds
 ruff check src tests && mypy
 ```
 

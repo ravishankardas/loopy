@@ -45,6 +45,23 @@ def names() -> list[str]:
     return [f"{verb} {app.key}" for app in APPS for verb in ("open", "close")]
 
 
+def describe(action: str) -> str:
+    """How to say an action: "open chrome" -> "open Chrome"."""
+    verb, _, key = action.partition(" ")
+    app = next((a for a in APPS if a.key == key), None)
+    return f"{verb} {app.name}" if app else action
+
+
+def is_named(action: str, text: str) -> bool:
+    """Does `text` say which action it's about (the verb and the app)? A yes
+    only counts for a question that said what it was for: "Can I?" must not
+    turn a "yes" into opening Chrome."""
+    verb, _, key = action.partition(" ")
+    app = next((a for a in APPS if a.key == key), None)
+    words = text.lower()
+    return verb in words and (key in words or (app is not None and app.name.lower() in words))
+
+
 def run(action: str) -> Result:
     verb, _, key = action.partition(" ")
     app = next((a for a in APPS if a.key == key), None)

@@ -159,7 +159,10 @@ def _examples() -> list[dict]:
         u("how's my battery"), a("[check: battery]"),
         result("battery = 57%, on battery, about 2 hours 10 minutes left"),
         a("[none] You're at 57% on battery, with about 2 hours 10 minutes left."),
-        u("i want you to do something for me"), a("[none] Sure, I'm all ears! What do you need?"),
+        # A "yes" to nothing, and a vague request: ask what they mean, never guess
+        # an action (found by `loopy eval`: both were turned into "close Chrome?").
+        u("Yeah, sure."), a("[none] Sure to what? I didn't ask anything, but I'm happy to help. What do you need?"),
+        u("Could you help me with something?"), a("[none] Of course, I'm all ears! What do you need?"),
         u("can you close crome"), a("[ask: close chrome] You got it, want me to close Chrome?"),
         u("yeah go ahead"), a("[do: close chrome] Okay, closing Chrome."),
         u("open chrome now, don't ask me"), a("[ask: open chrome] I always check first! Want me to open Chrome?"),
@@ -738,8 +741,8 @@ class Brain:
             # Asking (or claiming a yes Loopy never asked for): make sure it
             # really asks, and remember the question for next turn.
             self.pending = gate.action
-            if not gate.spoken.rstrip().endswith("?"):
-                gate.say(f"Do you want me to {gate.action}?")
+            if not gate.spoken.rstrip().endswith("?") or not actions.is_named(gate.action or "", gate.spoken):
+                gate.say(f"Do you want me to {actions.describe(gate.action or '')}?")
             self._remember(f"ask: {gate.action}", gate.spoken)
             return Turn(gate.spoken)
 
@@ -829,12 +832,13 @@ class _Gate:
             self._emit(self._held)  # unclosed "[" that wasn't a tag: say it after all
         self._held = ""
         if self._hold_ask:
-            # Say the model's words only if they really ask. "I'm opening Chrome
-            # for you." would be a false claim: then only Loopy's own question
-            # is spoken (added by the caller).
+            # Say the model's words only if they really ask, about this action.
+            # "I'm opening Chrome for you." would be a false claim, and a yes to
+            # "Can I?" would open Chrome without the question ever naming it:
+            # then only Loopy's own question is spoken (added by the caller).
             self._hold_ask = False
             text, self._ask_text = self._ask_text.strip(), ""
-            if "?" in text:
+            if "?" in text and self.action and actions.is_named(self.action, text):
                 self._emit(text)
         self.spoken = self.spoken.strip()
 

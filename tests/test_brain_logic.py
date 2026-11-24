@@ -108,9 +108,27 @@ class AskBeforeActing(BrainTest):
     def test_ask_that_claims_to_act_is_never_spoken(self):
         # Reported: "I'm opening Chrome for you. Do you want me to open chrome?"
         turn, said = self.turn("open chrome", "[ask: open chrome] I'm opening Chrome for you.")
-        self.assertEqual(said, "Do you want me to open chrome?")
+        self.assertEqual(said, "Do you want me to open Chrome?")
         self.assertEqual(self.actions.ran, [])
         self.assertEqual(self.brain.pending, "open chrome")
+
+    def test_a_question_must_say_what_it_is_for(self):
+        # Found by `loopy eval`: "Can you do something for me?" -> "[ask: open
+        # chrome] Can I?". A "yes" to that would open Chrome without the
+        # question ever naming it, so Loopy asks its own, clear question.
+        for vague in ["Can I?", "Want me to do it?", "Should I close it?",
+                      "Want me to close Chrome?"]:              # names the wrong action
+            with self.subTest(vague):
+                turn, said = self.turn("can you do something for me", f"[ask: open chrome] {vague}")
+                self.assertEqual(said, "Do you want me to open Chrome?")
+                self.assertEqual(self.brain.pending, "open chrome")
+
+    def test_a_clear_question_in_other_words_is_kept(self):
+        for clear in ["Should I open Chrome for you?", "Shall I close chrome now?"]:
+            action = "open chrome" if "open" in clear else "close chrome"
+            with self.subTest(clear):
+                turn, said = self.turn("hmm", f"[ask: {action}] {clear}")
+                self.assertEqual(said, clear)
 
     def test_ask_that_really_asks_is_spoken_as_is(self):
         turn, said = self.turn("open chrome", "[ask: open chrome] Sure, want me to open Chrome?")

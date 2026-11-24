@@ -35,6 +35,10 @@ def main(argv: list[str] | None = None) -> int:
     chat.add_argument("--speak", action="store_true", help="also speak Loopy's replies aloud")
     sub.add_parser("hear", help="test the microphone: prints what Loopy hears, live")
     sub.add_parser("knock-test", help="hit your laptop and see if Loopy notices (for tuning knock_peak)")
+    ev = sub.add_parser("eval", help="score Loopy on scripted conversations with the real model, write a report")
+    ev.add_argument("--repeat", type=int, default=1, help="run each case this many times (the model samples)")
+    ev.add_argument("--only", help="only this category (safety, intent, facts, games, chat) or case id prefix")
+    ev.add_argument("--out", default="eval-report", help="folder for report.md and results.json")
     args = parser.parse_args(argv)
 
     if args.command == "setup":
@@ -51,6 +55,8 @@ def main(argv: list[str] | None = None) -> int:
         return _hear()
     if args.command == "knock-test":
         return _knock_test()
+    if args.command == "eval":
+        return _eval(args.repeat, args.only, args.out)
 
     from loopy.app import run
 
@@ -82,6 +88,43 @@ def _rebuild() -> int:
     print(f"\nDone in {seconds:.0f} s. Saved {brain.warmup_path.name} ({size:.2f} GB).")
     print("The next `loopy` start will be fast.")
     return 0
+
+
+def _eval(repeat: int, only: str | None, out: str) -> int:
+    """Run the evaluation cases against the real model and write a report."""
+    from pathlib import Path
+
+    from loopy import evaluation, models
+    from loopy.brain import Brain
+
+    if not models.llm_installed():
+        print("The conversation model isn't installed yet. Run: loopy setup")
+        return 1
+    cases = evaluation.load_cases()
+    if only:
+        cases = [c for c in cases if c.category == only or c.id.startswith(only)]
+        if not cases:
+            print(f"No cases match '{only}'.")
+            return 1
+    turns = sum(len(c.turns) for c in cases) * repeat
+    print(f"Running {len(cases)} conversations ({turns} turns){f' x{repeat}' if repeat > 1 else ''}. "
+          "Actions are simulated: nothing on your computer is touched.\n", flush=True)
+    brain = Brain(models.llm_path())
+    brain.load()
+
+    def progress(r: evaluation.CaseResult) -> None:
+        mark = "UNSAFE" if r.unsafe else ("pass" if r.passed else "FAIL")
+        print(f"  {mark:6} {r.id}", flush=True)
+        for t in r.turns:
+            for f in t.failures:
+                print(f"           {f}", flush=True)
+
+    results = evaluation.run_eval(brain, cases, repeat, progress)
+    report = evaluation.write_report(results, Path(out), evaluation.default_meta(repeat))
+    s = evaluation.summary(results)
+    print(f"\nPassed {s['passed']}/{s['cases']}. Actions without permission: {s['unsafe_turns']}.")
+    print(f"Report: {report}")
+    return 1 if s["unsafe_turns"] else 0
 
 
 def _setup(voice_id: str | None, force: bool) -> int:

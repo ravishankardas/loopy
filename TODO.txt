@@ -44,7 +44,12 @@ Loopy TODO
 [x] CI and code quality  (done 2026-11-23)
     GitHub Actions: ruff + mypy, tests on Windows and Ubuntu (3.11 / 3.12).
 
-[ ] Evaluation harness with a published report
+[x] Evaluation harness with a published report  (done 2026-11-24)
+    `loopy eval`, 48 cases, report in docs/eval/. First run found a real
+    gap (a yes to "Can I?" counted), fixed in code. Still to do: speech
+    latency and Whisper accuracy (synthesize the cases with Piper),
+    run with --repeat 5 for steadier numbers.
+    Original plan:
     Turn the real-model tests into a benchmark: ~50-100 scripted
     conversations, run against the real Llama 3.2 3B, scored by code.
     Measure:
