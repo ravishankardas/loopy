@@ -105,20 +105,23 @@ class Listener:
         knock_above_noise: float = KNOCK_ABOVE_NOISE,
         on_sound: Callable[[KnockReading], None] | None = None,
         on_partial: Callable[[np.ndarray, int], None] | None = None,
-        partial_every: float | None = None,
+        on_progress: Callable[[np.ndarray], None] | None = None,
+        progress_every: float = 0.5,
     ):
         """Callbacks run on the listener thread. `on_utterance` gets mono
         float32 audio at 16 kHz, or an empty array if the speech turned out
         too short to be a command (so callers can undo on_speech_start).
         `on_knock` gets the peak level when someone hits the laptop.
         `on_partial` gets the utterance so far and where its speech ends (in
-        samples), for transcribing while the user talks: when they pause
-        (PAUSE_FRAMES of quiet, so the last call before on_utterance always
-        has all the speech) and, if `partial_every` is set, every that many
-        seconds while they speak."""
+        samples) when the user pauses (PAUSE_FRAMES of quiet), so the final
+        text can be made during the silence the listener waits for; the last
+        call before on_utterance always has all the speech.
+        `on_progress` gets the utterance so far every `progress_every`
+        seconds while the user speaks, for a live preview of the words."""
         self._on_utterance = on_utterance
         self._on_partial = on_partial
-        self._partial_every = int(partial_every * SAMPLE_RATE / FRAME) if partial_every else 0
+        self._on_progress = on_progress
+        self._progress_every = max(1, int(progress_every * SAMPLE_RATE / FRAME))
         self._on_speech_start = on_speech_start
         self._on_level = on_level
         self._on_knock = on_knock
@@ -300,11 +303,10 @@ class Listener:
             self._voiced_total += 1
             self._speech_end = len(self._utterance)
 
-        if self._on_partial:
-            paused = self._quiet_run == PAUSE_FRAMES
-            every = self._partial_every and self._quiet_run == 0 and len(self._utterance) % self._partial_every == 0
-            if paused or every:
-                self._on_partial(np.concatenate(self._utterance), self._speech_end * FRAME)
+        if self._on_partial and self._quiet_run == PAUSE_FRAMES:
+            self._on_partial(np.concatenate(self._utterance), self._speech_end * FRAME)
+        elif self._on_progress and self._quiet_run == 0 and len(self._utterance) % self._progress_every == 0:
+            self._on_progress(np.concatenate(self._utterance))
 
         too_long = len(self._utterance) * FRAME >= MAX_SECONDS * SAMPLE_RATE
         if self._quiet_run >= END_FRAMES or too_long:

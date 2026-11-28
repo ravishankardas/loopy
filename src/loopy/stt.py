@@ -50,17 +50,17 @@ class Transcriber:
 
 
 class LiveTranscription:
-    """Transcribes while you talk, so the text is (nearly) ready when you stop.
+    """Makes the final text while you pause, so it's ready when you stop.
 
-    The listener sends the audio so far with update(): every so often while
-    you speak (partial text for the speech bubble) and when you pause. The
-    pause pass runs during the silence the listener waits through anyway, and
-    if you don't speak again its result is the final text: finish() returns
-    it with no second pass. Only the newest audio is transcribed; one pass at
-    a time, on a background thread.
+    The listener sends the audio so far with update() when you pause. That
+    pass runs during the silence the listener waits through anyway, and if
+    you don't speak again its result is the final text: finish() returns it
+    with no second pass. Only the newest audio is transcribed; one pass at a
+    time, on a background thread. (The words shown while you talk come from
+    Preview, a smaller model.)
 
-        live = LiveTranscription(transcriber, on_partial=show)
-        live.update(audio_so_far, speech_end)   # from the listener, often
+        live = LiveTranscription(transcriber)
+        live.update(audio_so_far, speech_end)   # from the listener, on a pause
         text = live.finish(whole_utterance)     # blocks until the text is ready
     """
 
@@ -125,3 +125,76 @@ class LiveTranscription:
                 self._cond.notify_all()
             if current and text and self._on_partial:
                 self._on_partial(text)
+
+
+def load_streaming_model(model_dir: Path, threads: int = 1):
+    """The live-preview model (see models.preview_path), run by sherpa-onnx."""
+    import sherpa_onnx
+
+    return sherpa_onnx.OnlineRecognizer.from_transducer(
+        tokens=str(model_dir / "tokens.txt"), encoder=str(model_dir / "encoder.int8.onnx"),
+        decoder=str(model_dir / "decoder.int8.onnx"), joiner=str(model_dir / "joiner.int8.onnx"),
+        num_threads=threads, sample_rate=SAMPLE_RATE, feature_dim=80, decoding_method="greedy_search")
+
+
+class Preview:
+    """The words so far, shown while you talk, from a streaming model: it
+    decodes each new bit of audio as it arrives (~50 ms of work per 160 ms
+    of speech, on one core), so words flow in about a second behind the
+    voice without slowing the accurate final text. Only a preview: the
+    final text (Whisper) replaces it and is what Loopy acts on.
+
+        preview = Preview(lambda: load_streaming_model(models.preview_path()), on_text=show)
+        preview.update(audio_so_far)   # from the listener while you talk; only the new part is decoded
+        preview.cancel()               # you paused or stopped: start afresh next time
+    """
+
+    def __init__(self, load, on_text):
+        self._load = load             # () -> recognizer; called on the worker thread (takes ~1 s)
+        self._on_text = on_text
+        self._cond = threading.Condition()
+        self._generation = 0          # bumped by cancel(): a new stream, older results dropped
+        self._fed = 0                 # samples of this utterance already queued
+        self._queue: list[tuple[int, np.ndarray]] = []
+        threading.Thread(target=self._run, name="loopy-preview-stt", daemon=True).start()
+
+    def update(self, audio: np.ndarray) -> None:
+        with self._cond:
+            if len(audio) > self._fed:
+                self._queue.append((self._generation, audio[self._fed:]))
+                self._fed = len(audio)
+                self._cond.notify_all()
+
+    def cancel(self) -> None:
+        with self._cond:
+            self._generation += 1
+            self._fed = 0
+            self._queue.clear()
+
+    def _run(self) -> None:
+        try:
+            recognizer = self._load()
+        except Exception:
+            logger.exception("[live preview unavailable; speech recognition still works]")
+            return
+        stream, stream_generation, shown = None, -1, ""
+        while True:
+            with self._cond:
+                while not self._queue:
+                    self._cond.wait()
+                generation, samples = self._queue.pop(0)
+            try:
+                if stream is None or generation != stream_generation:      # a new utterance
+                    stream, stream_generation, shown = recognizer.create_stream(), generation, ""
+                stream.accept_waveform(SAMPLE_RATE, samples)
+                while recognizer.is_ready(stream):
+                    recognizer.decode_stream(stream)
+                text = recognizer.get_result(stream).strip()
+            except Exception:
+                logger.exception("[live preview failed; the final text is unaffected]")
+                continue
+            with self._cond:
+                current = generation == self._generation
+            if current and text and text != shown:
+                shown = text
+                self._on_text(text[0].upper() + text[1:])

@@ -109,6 +109,15 @@ class MarkdownIsNotSpoken(unittest.TestCase):
         self.assertEqual(streamed("[none] Oh, you're *trying* to win? How **utterly** pathetic."),
                          "Oh, you're trying to win? How utterly pathetic.")
 
+    def test_stage_directions_are_not_read_out(self):
+        # Gemma: "*clears throat*" was spoken as the words "clears throat"
+        said = streamed("[none] Okay, let me see… *clears throat* Row, row, row your boat.")
+        self.assertNotIn("clears", said)
+        self.assertIn("Row, row, row your boat.", said)
+
+    def test_a_lone_star_is_not_markup(self):
+        self.assertEqual(streamed("[none] Five * three is fifteen."), "Five  three is fifteen.")
+
 
 class GameStartIsNotSaidTwice(unittest.TestCase):
     """The app explains the rules after [game: start], so the model's own

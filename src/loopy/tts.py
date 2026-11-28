@@ -54,6 +54,7 @@ class SpeechStream:
         self._closed = False
         self._cancelled = False
         self._cond = threading.Condition()
+        self.first_audio_at: float | None = None   # time.monotonic() when sound first went out
 
     def feed(self, text: str) -> None:
         with self._cond:
@@ -253,6 +254,8 @@ class Speaker:
                     for i in range(0, len(audio), block):
                         if self._stop.is_set():
                             break
+                        if s.first_audio_at is None:
+                            s.first_audio_at = time.monotonic()
                         if out.write(audio[i:i + block]):  # True = it had run dry
                             self.underflows += 1
         finally:

@@ -8,7 +8,7 @@ import unittest
 import numpy as np
 
 from loopy.listener import END_FRAMES, FRAME, PAUSE_FRAMES, Listener
-from loopy.stt import LiveTranscription
+from loopy.stt import LiveTranscription, Preview
 
 
 class FakeWhisper:
@@ -87,6 +87,77 @@ class Live(unittest.TestCase):
         self.assertEqual(live.finish(self.audio(56)), "fine")
 
 
+class FakeStreamingModel:
+    """Like sherpa-onnx's OnlineRecognizer: 'hears' one word per chunk fed."""
+
+    class Stream:
+        def __init__(self):
+            self.samples = 0
+            self.words: list[str] = []
+
+        def accept_waveform(self, rate, samples):
+            self.samples += len(samples)
+            self.words.append(f"w{len(samples) // FRAME}")
+
+    def __init__(self):
+        self.streams: list[FakeStreamingModel.Stream] = []
+
+    def create_stream(self):
+        self.streams.append(self.Stream())
+        return self.streams[-1]
+
+    def is_ready(self, stream):
+        return False
+
+    def decode_stream(self, stream):
+        pass
+
+    def get_result(self, stream):
+        return " ".join(stream.words)
+
+
+class LivePreview(unittest.TestCase):
+    def setUp(self):
+        self.model = FakeStreamingModel()
+        self.shown: list[str] = []
+        self.preview = Preview(lambda: self.model, on_text=self.shown.append)
+
+    def audio(self, frames):
+        return np.zeros(frames * FRAME, dtype=np.float32)
+
+    def wait_for(self, n):
+        for _ in range(100):
+            if len(self.shown) >= n:
+                return
+            threading.Event().wait(0.02)
+        self.fail(f"only {self.shown}")
+
+    def test_only_the_new_audio_is_decoded(self):
+        self.preview.update(self.audio(5))
+        self.preview.update(self.audio(10))   # the utterance so far: 5 new frames
+        self.preview.update(self.audio(10))   # nothing new
+        self.wait_for(2)
+        self.assertEqual(self.model.streams[0].samples, 10 * FRAME)
+        self.assertEqual(self.shown, ["W5", "W5 w5"])     # shown as it grows
+
+    def test_a_new_utterance_starts_a_new_stream(self):
+        self.preview.update(self.audio(5))
+        self.wait_for(1)
+        self.preview.cancel()                  # the user stopped talking
+        self.preview.update(self.audio(3))     # next utterance, from the start
+        self.wait_for(2)
+        self.assertEqual(len(self.model.streams), 2)
+        self.assertEqual(self.shown[-1], "W3")
+
+    def test_a_broken_model_does_not_break_listening(self):
+        def broken():
+            raise RuntimeError("no model")
+
+        preview = Preview(broken, on_text=self.shown.append)
+        preview.update(self.audio(5))          # must not raise
+        preview.cancel()
+
+
 class ScriptedVoice:
     """Stands in for the voice detector: one speech probability per frame."""
 
@@ -101,11 +172,12 @@ class ScriptedVoice:
 
 
 class ListenerSendsAudioSoFar(unittest.TestCase):
-    def run_listener(self, pattern, partial_every=None):
+    def run_listener(self, pattern):
         """pattern: one probability per frame from the voice detector."""
         sent, done = [], []
+        self.progress: list[int] = []
         mic = Listener(on_utterance=done.append, on_partial=lambda a, end: sent.append((len(a), end)),
-                       partial_every=partial_every)
+                       on_progress=lambda a: self.progress.append(len(a)), progress_every=0.5)
         mic._vad = ScriptedVoice(pattern)
         mic.knocks_enabled = False
         for _ in pattern:
@@ -129,9 +201,15 @@ class ListenerSendsAudioSoFar(unittest.TestCase):
         self.assertEqual(speech_end, 45 * FRAME)
         self.assertGreaterEqual(frames, speech_end)
 
-    def test_live_passes_while_talking(self):
-        sent, _ = self.run_listener([0.9] * 40 + [0.0] * (END_FRAMES + 2), partial_every=0.5)
-        self.assertGreaterEqual(len(sent), 3)   # every ~16 frames, then the pause
+    def test_progress_every_half_second_while_talking(self):
+        sent, _ = self.run_listener([0.9] * 50 + [0.0] * (END_FRAMES + 2))
+        self.assertEqual(len(sent), 1)                     # the pause pass only
+        self.assertGreaterEqual(len(self.progress), 2)     # ~every 16 frames of talking
+        self.assertEqual(self.progress, sorted(self.progress))  # always the utterance so far
+
+    def test_no_progress_while_quiet(self):
+        self.run_listener([0.9] * 5 + [0.0] * (END_FRAMES + 30))
+        self.assertEqual(self.progress, [])
 
     def test_without_the_hook_nothing_changes(self):
         done = []

@@ -180,6 +180,16 @@ def _setup(voice_id: str | None, force: bool, model: str | None = None) -> int:
     if voice_id:
         settings.save(voice=voice.id)
 
+    logger.info(f"Live preview of your words ({models.PREVIEW_NAME}, ~100 MB download):")
+    if models.preview_installed() and not force:
+        logger.info("  already installed")
+    else:
+        try:
+            models.install_preview(force=force, progress=_log_progress())
+        except OSError as exc:
+            logger.error(f"Download failed: {exc}. Check your internet connection and run 'loopy setup' again.")
+            return 1
+
     logger.info(f"Speech recognition (Whisper {models.STT_MODEL}):")
     if models.stt_installed() and not force:
         logger.info("  already installed")

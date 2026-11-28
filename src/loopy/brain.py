@@ -76,7 +76,6 @@ TAUNT_LOOPY_WINS = ["Paperclip one, human zero. Shocking, I know.", "Too easy. N
                     "Was that your best? Asking for a friend."]
 TAUNT_DRAW = ["A draw. I'll call that mercy.", "You survived. Barely.",
               "Draw. I was clearly being generous."]
-
 TextOut = Callable[[str], None]   # receives reply text piece by piece
 GameEvent = Callable[..., None]   # ("start", loopy_first) ("place", cell, mark) ("thinking",)
                                   # ("illegal", cell, why) ("your_turn",) ("over", winner, line, scores) ("stop",)
@@ -438,65 +437,68 @@ class Brain:
             on_text = self._out  # everything spoken this turn goes through _out
             self._trim(llm)
             self._history.append({"role": "user", "content": text})
+            return self._respond(llm, on_text)
+
+    def _respond(self, llm, on_text: TextOut) -> Turn:
+        gate = self._generate_with_words(llm, on_text)
+
+        checked: list[tuple[str, str]] = []
+        for _ in range(MAX_CHECK_ROUNDS):
+            if gate.kind != "check":
+                break
+            # Look the facts up for real, then let the model answer with
+            # them (it may ask for another fact first, e.g. "time and battery").
+            new = [n for n in gate.checks if n not in dict(checked)]
+            if not new:
+                break  # asking for the same thing again: stop looping
+            found = [(name, checks.read(name)) for name in new]
+            checked += found
+            self._history.append({"role": "assistant", "content": f"[check: {', '.join(new)}]"})
+            result = "; ".join(f"{n} = {v}" for n, v in found)
+            self._history.append({"role": "system", "content": f"Result: {result}"})
             gate = self._generate_with_words(llm, on_text)
+        if gate.kind == "check":  # still asking instead of answering: say the facts ourselves
+            gate = _Gate(self.pending, on_text)
+            gate.say("Here's what I found: " + "; ".join(f"{n}, {v}" for n, v in checked) + ".")
+        elif checked and not gate.spoken:
+            # Looked something up, then said nothing: say the facts ourselves.
+            gate.say("Here's what I found: " + "; ".join(f"{n}, {v}" for n, v in checked) + ".")
+        elif checked:
+            # It looked something up but answered vaguely ("pretty busy"):
+            # add the real numbers it left out.
+            # The first number is the headline (the battery's 57%, the hour):
+            # saying only a lesser one ("2 hours 10 minutes left") isn't enough
+            # (found by `loopy eval --speech`).
+            for _name, value in checked:
+                numbers = re.findall(r"\d+(?:\.\d+)?", value)
+                if numbers and not re.search(rf"(?<![\d.]){re.escape(numbers[0])}(?![\d.])", gate.spoken):
+                    gate.say(f"To be exact: {value}.")
 
-            checked: list[tuple[str, str]] = []
-            for _ in range(MAX_CHECK_ROUNDS):
-                if gate.kind != "check":
-                    break
-                # Look the facts up for real, then let the model answer with
-                # them (it may ask for another fact first, e.g. "time and battery").
-                new = [n for n in gate.checks if n not in dict(checked)]
-                if not new:
-                    break  # asking for the same thing again: stop looping
-                found = [(name, checks.read(name)) for name in new]
-                checked += found
-                self._history.append({"role": "assistant", "content": f"[check: {', '.join(new)}]"})
-                result = "; ".join(f"{n} = {v}" for n, v in found)
-                self._history.append({"role": "system", "content": f"Result: {result}"})
-                gate = self._generate_with_words(llm, on_text)
-            if gate.kind == "check":  # still asking instead of answering: say the facts ourselves
-                gate = _Gate(self.pending, on_text)
-                gate.say("Here's what I found: " + "; ".join(f"{n}, {v}" for n, v in checked) + ".")
-            elif checked and not gate.spoken:
-                # Looked something up, then said nothing: say the facts ourselves.
-                gate.say("Here's what I found: " + "; ".join(f"{n}, {v}" for n, v in checked) + ".")
-            elif checked:
-                # It looked something up but answered vaguely ("pretty busy"):
-                # add the real numbers it left out.
-                # The first number is the headline (the battery's 57%, the hour):
-                # saying only a lesser one ("2 hours 10 minutes left") isn't enough
-                # (found by `loopy eval --speech`).
-                for _name, value in checked:
-                    numbers = re.findall(r"\d+(?:\.\d+)?", value)
-                    if numbers and not re.search(rf"(?<![\d.]){re.escape(numbers[0])}(?![\d.])", gate.spoken):
-                        gate.say(f"To be exact: {value}.")
+        if gate.fake_board and gate.kind == "none" and (self.game is None or self.game.over):
+            # It drew a board in text instead of starting the game
+            # ("Here's the board: 1 | 2 | 3"): that's what it meant, so start
+            # the real one. (The text board itself was never spoken.)
+            gate.kind, gate.game_cmd = "game", "start"
 
-            if gate.fake_board and gate.kind == "none" and (self.game is None or self.game.over):
-                # It drew a board in text instead of starting the game
-                # ("Here's the board: 1 | 2 | 3"): that's what it meant, so start
-                # the real one. (The text board itself was never spoken.)
-                gate.kind, gate.game_cmd = "game", "start"
+        if gate.kind == "none" and not gate.spoken and not checked:
+            # Still nothing after every retry: Loopy must never go silent.
+            # ([ask]/[do] always get Loopy's own words in _decide.)
+            gate.say("Sorry, I lost my train of thought. Could you say that again?")
 
-            if gate.kind == "none" and not gate.spoken and not checked:
-                # Still nothing after every retry: Loopy must never go silent.
-                # ([ask]/[do] always get Loopy's own words in _decide.)
-                gate.say("Sorry, I lost my train of thought. Could you say that again?")
-
-            if gate.kind in ("game", "move"):
-                self.pending = None
-                self._game_turn(llm, gate)
-                turn = Turn("")
-            else:
-                if self.game is not None and self.game.over:
-                    # The game ended and this isn't a rematch ("no thanks",
-                    # or just chatting on): close the leftover board.
-                    self.game = None
-                    self._on_event("stop")
-                turn = self._decide(gate)
-            turn.reply = "".join(self._said).strip()
-            turn.checked = checked
-            return turn
+        if gate.kind in ("game", "move"):
+            self.pending = None
+            self._game_turn(llm, gate)
+            turn = Turn("")
+        else:
+            if self.game is not None and self.game.over:
+                # The game ended and this isn't a rematch ("no thanks",
+                # or just chatting on): close the leftover board.
+                self.game = None
+                self._on_event("stop")
+            turn = self._decide(gate)
+        turn.reply = "".join(self._said).strip()
+        turn.checked = checked
+        return turn
 
     # ---------------------------------------------------------- tic-tac-toe
 
@@ -906,6 +908,9 @@ class _Gate:
         self.cell: int | None = None         # [move: N] / [play: N]
         self.game_cmd: str | None = None     # [game: start|stop]
         self._held = ""          # possible mid-reply "[tag]" not yet closed
+        self._star_open = False  # inside "*...*" (see _strip_stars)
+        self._starred = ""       # the words since that "*"
+        self._star_just_closed = False
         self.allowed_to_run = False
         self.spoken = ""
         self._body_start: int | None = None
@@ -955,8 +960,7 @@ class _Gate:
         piece = raw[self._pos:end]
         self._pos = end
         if piece and not self._suppress:
-            # "*" is markdown emphasis (Gemma: "you're *trying*"): never spoken
-            self._emit(self._strip_tags(piece.replace("\r", " ").replace("\n", " ").replace("*", "")))
+            self._emit(self._strip_tags(self._strip_stars(piece.replace("\r", " ").replace("\n", " "))))
 
     def finish(self, raw: str) -> None:
         if self._body_start is None:  # never found a tag: treat it all as chat
@@ -965,6 +969,9 @@ class _Gate:
         if self._held and not self._looks_like_tag(self._held) and not self._suppress:
             self._emit(self._held)  # unclosed "[" that wasn't a tag: say it after all
         self._held = ""
+        if self._starred and not self._suppress:
+            self._emit(self._starred)  # a "*" that never closed: just a star, say the words
+        self._starred = ""
         if self._hold_ask:
             # Say the model's words only if they really ask, about this action.
             # "I'm opening Chrome for you." would be a false claim, and a yes to
@@ -995,6 +1002,33 @@ class _Gate:
         """'[check: ti' or a cut-off '[chec' (reply hit its length limit)."""
         word = held[1:].strip().split(":")[0].strip().lower()
         return bool(self._TAG_START.match(held)) or (word != "" and any(w.startswith(word) for w in self._TAG_WORDS))
+
+    def _strip_stars(self, text: str) -> str:
+        """Markdown stars are never spoken. Two or more words between stars
+        are a stage direction ("*clears throat*"): the voice would read them
+        out as words, so they're dropped. One word is emphasis ("you're
+        *trying*"): the word stays. Text after a "*" is held back until the
+        closing one; never closed within MAX_HELD, it was just a star."""
+        out = ""
+        for ch in text:
+            if ch == "*":
+                if self._star_open and self._starred.strip():
+                    words = self._starred.strip()
+                    if len(words.split()) == 1:
+                        out += words                       # emphasis: keep the word
+                    self._star_open, self._starred, self._star_just_closed = False, "", True
+                elif not self._star_open and not self._star_just_closed:
+                    self._star_open = True                 # (a second "*" of "**" is skipped)
+                continue
+            self._star_just_closed = False
+            if self._star_open:
+                self._starred += ch
+                if len(self._starred) > self.MAX_HELD:
+                    out += self._starred                   # never closed: wasn't markup
+                    self._star_open, self._starred = False, ""
+            else:
+                out += ch
+        return out
 
     def _strip_tags(self, text: str) -> str:
         """Drop bracketed tags the model writes mid-reply ("...find out. [check:

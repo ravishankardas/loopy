@@ -90,6 +90,10 @@ LLMS = [
         "Llama-3.2-3B-Instruct-Q4_K_M.gguf", "1.9 GB"),
     LLM("gemma-3-4b", "Gemma 3 4B Instruct (Q4_K_M)", "bartowski/google_gemma-3-4b-it-GGUF",
         "google_gemma-3-4b-it-Q4_K_M.gguf", "2.5 GB", system_role=False),
+    # Google's quantization-aware-trained build: made for 4 bits, and Q4_0 is
+    # the format llama.cpp's fastest CPU kernels are written for.
+    LLM("gemma-3-4b-qat", "Gemma 3 4B Instruct QAT (Q4_0)", "bartowski/google_gemma-3-4b-it-qat-GGUF",
+        "google_gemma-3-4b-it-qat-Q4_0.gguf", "2.4 GB", system_role=False),
 ]
 DEFAULT_LLM = LLMS[0]
 
@@ -142,6 +146,46 @@ def install_stt(force: bool = False) -> None:
     from faster_whisper import download_model
 
     download_model(STT_MODEL, output_dir=str(stt_path()))
+
+
+# The live preview of the words while you talk: a streaming model (NVIDIA NeMo
+# FastConformer transducer, 80 ms look-ahead, int8, ~137 MB) run by sherpa-onnx.
+# It decodes 160 ms chunks as they arrive, on ~30% of one core, so it doesn't
+# slow the accurate final text (Whisper). Only shown; never acted on.
+PREVIEW_NAME = "NeMo FastConformer streaming (80 ms)"
+_PREVIEW_ARCHIVE = "sherpa-onnx-nemo-streaming-fast-conformer-transducer-en-80ms-int8"
+_PREVIEW_URL = f"https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/{_PREVIEW_ARCHIVE}.tar.bz2"
+PREVIEW_FILES = ("encoder.int8.onnx", "decoder.int8.onnx", "joiner.int8.onnx", "tokens.txt")
+
+
+def preview_path() -> Path:
+    return DATA_DIR / "stt" / "preview-nemo-80ms"
+
+
+def preview_installed() -> bool:
+    return all((preview_path() / name).is_file() for name in PREVIEW_FILES)
+
+
+def install_preview(force: bool = False, progress: Progress | None = None) -> None:
+    """Download the release archive and keep only the model files."""
+    if preview_installed() and not force:
+        return
+    import tarfile
+
+    archive = DATA_DIR / "stt" / f"{_PREVIEW_ARCHIVE}.tar.bz2"
+    _download(_PREVIEW_URL, archive, progress)
+    try:
+        with tarfile.open(archive) as tar:
+            for member in tar.getmembers():
+                name = Path(member.name).name
+                if name in PREVIEW_FILES and member.isfile():
+                    source = tar.extractfile(member)
+                    assert source is not None
+                    dest = preview_path() / name
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    dest.write_bytes(source.read())
+    finally:
+        archive.unlink(missing_ok=True)
 
 
 def install_voice(voice: Voice, force: bool = False, progress: Progress | None = None) -> None:

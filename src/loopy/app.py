@@ -22,7 +22,7 @@ from PySide6.QtWidgets import QApplication, QInputDialog, QMenu
 
 from loopy import models, settings, wake
 from loopy.game import X_COLOR, BoardWindow, Celebration
-from loopy.listener import KNOCK_ABOVE_NOISE, KNOCK_PEAK
+from loopy.listener import END_FRAMES, FRAME, KNOCK_ABOVE_NOISE, KNOCK_PEAK, SAMPLE_RATE
 from loopy.log import logger, setup_logging
 from loopy.mascot import Activity, Mascot, State
 from loopy.models import Voice
@@ -31,14 +31,14 @@ from loopy.snake import SnakeWindow
 if TYPE_CHECKING:  # loaded lazily at runtime (heavy imports)
     from loopy.brain import Brain
     from loopy.sounds import Clip
-    from loopy.stt import LiveTranscription, Transcriber
+    from loopy.stt import LiveTranscription, Preview, Transcriber
     from loopy.tts import Speaker
 
 DEFAULT_SLEEP_AFTER = 60  # seconds without activity before Loopy dozes off
 GAME_SLEEP_AFTER = 300    # ...longer during a game, so you have time to think
-# Seconds between live transcription passes while the user talks (partial text
-# in the bubble), or None for only the pass when they pause. See LiveTranscription.
-LIVE_PASS_EVERY: float | None = None
+# How often new audio goes to the live preview of the words (a streaming
+# model, see stt.Preview): its chunk size, so the words flow in smoothly.
+PREVIEW_EVERY = 0.16
 SNAKE_ANSWER_SECONDS = 30 # "still playing snake?" with no answer: close it
 
 
@@ -95,6 +95,11 @@ class Assistant(QObject):
         self._thinking = False
         self._transcribing = False
         self._hearing = False                # someone is talking right now
+        # Where the time goes in a turn (logged once per reply, see _log_timing)
+        self._stopped_at: float | None = None   # when the user stopped talking
+        self._text_at: float | None = None      # when their words were final
+        self._timing: dict | None = None
+        self._timing_stream = None
         self._brain_loaded = False
         self.brain_error = ""
         self.start_with_game: str | None = None  # "tic-tac-toe"/"snake": a game instead of hello
@@ -163,6 +168,7 @@ class Assistant(QObject):
         # Ears: always-on listener -> Whisper.
         self.transcriber: Transcriber | None = None
         self.live: LiveTranscription | None = None
+        self.preview: Preview | None = None
         self.listener = None
         self.mic_error = None
         if models.stt_installed():
@@ -171,13 +177,29 @@ class Assistant(QObject):
 
             self.transcriber = stt.Transcriber(models.stt_path())
             threading.Thread(target=self.transcriber.load, daemon=True).start()  # warm up
-            # Streaming: transcribe while the user talks, so the text is ready
-            # (nearly) as soon as they stop. See stt.LiveTranscription.
-            self.live = stt.LiveTranscription(self.transcriber, on_partial=self._hearing_so_far.emit)
+            # Streaming: the words appear as the user talks (a small preview
+            # model), and the accurate final text is made while they pause,
+            # so it's ready as soon as they stop. See stt.Preview / LiveTranscription.
+            self.live = live = stt.LiveTranscription(self.transcriber)
+            if models.preview_installed():
+                self.preview = stt.Preview(lambda: stt.load_streaming_model(models.preview_path()),
+                                           on_text=self._hearing_so_far.emit)
+            preview = self.preview
+
+            def paused(audio: np.ndarray, speech_end: int) -> None:
+                if preview:
+                    preview.cancel()          # the final pass needs the CPU now
+                live.update(audio, speech_end)
+
+            def talking(audio: np.ndarray) -> None:
+                if preview and self.awake:      # asleep: nobody is looking at the bubble
+                    preview.update(audio)
+
             self.listener = Listener(
                 on_utterance=self._utterance.emit,
-                on_partial=self.live.update,
-                partial_every=LIVE_PASS_EVERY,
+                on_partial=paused,
+                on_progress=talking,
+                progress_every=PREVIEW_EVERY,
                 on_speech_start=self._speech_detected.emit,
                 on_level=self._mic_level.emit,
                 on_knock=self._knock.emit,
@@ -330,8 +352,12 @@ class Assistant(QObject):
 
     def _on_utterance(self, audio: np.ndarray) -> None:
         self._hearing = False
+        # The listener calls this after END_FRAMES of silence: the speech ended that long ago.
+        self._stopped_at = time.monotonic() - END_FRAMES * FRAME / SAMPLE_RATE
         live = self.live
         assert live is not None, "speech only reaches here once the transcriber exists"
+        if self.preview:
+            self.preview.cancel()
         if len(audio) == 0:  # too short to be speech
             live.cancel()
             self._back_to_rest()
@@ -350,6 +376,7 @@ class Assistant(QObject):
 
     def _on_heard(self, text: str) -> None:
         self._transcribing = False
+        self._text_at = time.monotonic()
         self._refresh_status()
         woke, rest = wake.split_wake(text)
         if text:
@@ -411,10 +438,18 @@ class Assistant(QObject):
         stream = self._open_speech() if self.speaker else None
         speak = stream.feed if stream else self._thought.emit
         self._spoken = ""
+        # Time this turn from when the user stopped talking (not for typed text or games from the menu).
+        heard_now = (not new_game and self._stopped_at is not None and self._text_at is not None
+                     and 0 <= self._text_at - self._stopped_at < 10)
+        timing = {"stopped": self._stopped_at, "text": self._text_at} if heard_now else None
+        self._timing, self._timing_stream = timing, stream
+        self._stopped_at = None
 
         line: list[str] = []  # Loopy's words so far; logged as one line once the reply (or a part) ends
 
         def out(piece: str) -> None:  # to the voice as it's written, and to the log
+            if timing is not None and "words" not in timing and piece.strip():
+                timing["words"] = time.monotonic()
             speak(piece)
             line.append(piece)
 
@@ -648,6 +683,8 @@ class Assistant(QObject):
             self.speaker.set_model(voice.path)
 
     def _on_speech_started(self, _first: str) -> None:
+        if self._timing is not None and "voice" not in self._timing:
+            self._timing["voice"] = time.monotonic()   # first chunk handed to the voice
         self._busy()
         self._speaking = True
         self._spoken = ""
@@ -667,7 +704,20 @@ class Assistant(QObject):
         self._spoken = (self._spoken + piece).lstrip()
         self.mascot.show_bubble(self._spoken[-140:], None)
 
+    def _log_timing(self) -> None:
+        """One line per reply: where the time went, from when the user stopped talking."""
+        timing, stream = self._timing, self._timing_stream
+        if timing is None or stream is None or stream.first_audio_at is None:
+            return
+        self._timing = None
+        t0 = timing["stopped"]
+        steps = [("text", timing["text"]), ("first words", timing.get("words")),
+                 ("voice starts", timing.get("voice")), ("sound", stream.first_audio_at)]
+        _log("       [timing] " + " | ".join(f"{name} +{t - t0:.1f} s" for name, t in steps if t is not None)
+             + "   (after you stopped talking)")
+
     def _on_speech_finished(self) -> None:
+        self._log_timing()
         self._speaking = False
         QTimer.singleShot(300, self._resume_listening)  # let the room go quiet first
         if self.mascot.state() == State.SPEAKING:
