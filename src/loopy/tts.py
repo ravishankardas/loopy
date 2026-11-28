@@ -35,7 +35,9 @@ Callback = Callable[[], None] | None
 import time
 
 MIN_CHUNK_WORDS = 3       # never speak fewer words than this (unless it's the end)
-FIRST_PUNCT_WAIT = 0.5    # first chunk: once 3 words exist, wait this long for a , or .
+MIN_FIRST_WORDS = 2       # ...except the first chunk: start talking as soon as 2 words exist
+FIRST_PUNCT_WAIT = 0.15   # first chunk: once those exist, wait this long for a , or .
+                          # (measured: the old 3 words + 0.5 s cost ~1 s before Loopy spoke)
 PUNCT_WAIT = 0.2          # later chunks: same, but shorter than OUTPUT_LATENCY so the
                           # audio already queued covers the wait (no gap)
 OUTPUT_LATENCY = 0.4      # seconds of audio buffered ahead; hides synthesis time
@@ -76,16 +78,17 @@ class SpeechStream:
         """Block until there's something worth saying; None when finished."""
         since = time.monotonic()
         wait_for_punct = FIRST_PUNCT_WAIT if first else PUNCT_WAIT
+        min_words = MIN_FIRST_WORDS if first else MIN_CHUNK_WORDS
         with self._cond:
             while True:
                 if self._cancelled:
                     return None
                 # Wait briefly for punctuation so phrases aren't split mid-way.
-                # For the first chunk the clock starts once 3 words exist.
-                if first and len(self._buf.split()) < MIN_CHUNK_WORDS:
+                # For the first chunk the clock starts once its words exist.
+                if first and len(self._buf.split()) < min_words:
                     since = time.monotonic()
                 patient = time.monotonic() - since < wait_for_punct
-                cut = self._cut(allow_mid_phrase=not patient)
+                cut = self._cut(allow_mid_phrase=not patient, min_words=min_words)
                 if cut:
                     chunk, self._buf = self._buf[:cut], self._buf[cut:]
                     if chunk.strip():
@@ -95,14 +98,14 @@ class SpeechStream:
                     return None
                 self._cond.wait(0.03)
 
-    def _cut(self, allow_mid_phrase: bool) -> int:
+    def _cut(self, allow_mid_phrase: bool, min_words: int = MIN_CHUNK_WORDS) -> int:
         """How much of the buffer to speak now (0 = wait for more)."""
         buf = self._buf
         if self._closed:
             return len(buf)
-        # Prefer the last punctuation that leaves a chunk of at least 3 words.
+        # Prefer the last punctuation that leaves a chunk of at least min_words.
         for m in reversed(list(_BOUNDARY.finditer(buf))):
-            if len(buf[:m.end()].split()) >= MIN_CHUNK_WORDS:
+            if len(buf[:m.end()].split()) >= min_words:
                 return m.end()
             break  # earlier boundaries only make it shorter
         if not allow_mid_phrase:
@@ -111,7 +114,7 @@ class SpeechStream:
         last_space = buf.rfind(" ")
         if last_space <= 0:
             return 0
-        return last_space if len(buf[:last_space].split()) >= MIN_CHUNK_WORDS else 0
+        return last_space if len(buf[:last_space].split()) >= min_words else 0
 
 
 class Speaker:

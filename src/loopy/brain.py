@@ -37,10 +37,13 @@ import pickle
 import random
 import re
 import threading
+import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
+
+from loguru import logger
 
 from loopy import actions, checks, models
 from loopy.game import CELL_NAMES, TicTacToe
@@ -782,6 +785,10 @@ class Brain:
 
         gate = _Gate(self.pending, spaced, validate_play, play_words)
         raw = ""
+        cached = _cached_tokens(llm)
+        started = time.monotonic()
+        first_token: float | None = None
+        written = 0
         stream = llm.create_chat_completion(
             self._messages(self._history),
             max_tokens=MAX_REPLY_TOKENS,
@@ -790,6 +797,9 @@ class Brain:
         )
         try:
             for chunk in stream:
+                written += 1
+                if first_token is None:
+                    first_token = time.monotonic()
                 piece = chunk["choices"][0]["delta"].get("content") or ""
                 if piece:
                     raw += piece
@@ -799,7 +809,26 @@ class Brain:
         finally:
             stream.close()
         gate.finish(raw)
+        self._log_call(llm, cached, started, first_token, written)
         return gate
+
+    @staticmethod
+    def _log_call(llm, cached_before: list[int] | None, started: float, first_token: float | None,
+                  written: int) -> None:
+        """How much of the prompt was read fresh vs reused from the cache: the
+        reading is what delays the first word on a laptop CPU."""
+        after = _cached_tokens(llm)
+        if cached_before is None or after is None or first_token is None:
+            return  # not llama.cpp (tests)
+        prompt = len(after) - written
+        reused = 0
+        for a, b in zip(cached_before, after[:prompt], strict=False):
+            if a != b:
+                break
+            reused += 1
+        done = time.monotonic()
+        logger.info(f"       [model] read {prompt - reused} new tokens in {first_token - started:.1f} s "
+                     f"({reused} reused), wrote {written} in {done - first_token:.1f} s")
 
     def _decide(self, gate: "_Gate") -> Turn:
         # History records what Loopy actually said and did, not what the
@@ -868,6 +897,12 @@ def _game_reaction(text: str) -> str:
             break
         kept.append(sentence)
     return " ".join(kept)
+
+
+def _cached_tokens(llm) -> list[int] | None:
+    """The tokens llama.cpp has in its cache right now (None if it isn't llama.cpp)."""
+    ids, n = getattr(llm, "_input_ids", None), getattr(llm, "n_tokens", None)
+    return None if ids is None or not isinstance(n, int) else [int(t) for t in ids[:n]]
 
 
 def _fold_system(messages: list[dict]) -> list[dict]:

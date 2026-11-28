@@ -27,7 +27,8 @@ SAMPLE_RATE = 16_000
 FRAME = 512                  # 32 ms: the chunk size the VAD model expects
 START_PROB, END_PROB = 0.5, 0.35
 START_FRAMES = 3             # ~100 ms of voice before it counts as speech
-END_FRAMES = 22              # ~700 ms of quiet ends an utterance
+END_FRAMES = 16              # ~510 ms of quiet ends an utterance (700 ms felt slow; the
+                             # final text is made during it, see PAUSE_FRAMES)
 PREROLL_FRAMES = 15          # keep ~480 ms from before speech was detected
 MAX_SECONDS = 15
 MIN_SECONDS = 0.4
