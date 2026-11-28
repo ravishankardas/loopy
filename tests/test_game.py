@@ -6,10 +6,13 @@ their comments are never spoken, the model is told why, and the game always
 ends with the right winner.
 """
 
+import os
 import unittest
 from unittest import mock
 
-from fakes import FakeLlama, RecordedActions
+os.environ.setdefault("LOOPY_LOG_FILE", "")  # `loopy` commands run here mustn't write to the real log file
+
+from fakes import FakeLlama, RecordedActions  # noqa: E402
 from loopy import actions, brain
 from loopy.brain import Brain
 from loopy.game import WIN_LINES, TicTacToe
@@ -179,7 +182,7 @@ class TrashTalk(GameTest):
         self.start()
         self.turn("put a cross in 2", "[move: 2]", "[play: 5] Cute.")
         board_msg = self.last_system_message(call=1)
-        self.assertIn("The user just put X in 2 (top-middle)", board_msg)
+        self.assertIn("The user took 2 (top-middle)", board_msg)
 
     def test_the_model_is_told_what_it_already_said(self):
         # Seen with the real model: "Corner move, gotta keep it tight!" four times.
@@ -187,8 +190,7 @@ class TrashTalk(GameTest):
         self.turn("5", "[move: 5]", "[play: 1] Corner move, gotta keep it tight!")
         self.turn("9", "[move: 9]", "[play: 3] Something else!")
         board_msg = self.last_system_message(call=1)
-        self.assertIn('You already said: "Corner move, gotta keep it tight!"', board_msg)
-        self.assertIn("Say something new", board_msg)
+        self.assertIn('Not again: "Corner move, gotta keep it tight!"', board_msg)
 
     def test_a_new_game_starts_with_a_clean_slate(self):
         self.start()
@@ -215,6 +217,89 @@ class TrashTalk(GameTest):
         prompt = brain._system_prompt()
         self.assertIn("snippy, sassy", prompt)       # requested: snippy, not cheerful
         self.assertIn("Not cheerful", prompt)
+
+
+class TruthfulTrashTalk(GameTest):
+    """Reported: "Corner's mine." while Loopy took the center."""
+
+    def said_for(self, user_cell: int, loopy_reply: str) -> str:
+        self.start()
+        said, _ = self.turn(f"put a cross in {user_cell}", f"[move: {user_cell}]", loopy_reply)
+        return said
+
+    def test_a_wrong_claim_is_replaced_by_the_real_cell(self):
+        said = self.said_for(1, "[play: 5] Corner's mine.")
+        self.assertNotIn("Corner", said)
+        self.assertIn("The center's mine.", said)
+
+    # One game per test: Loopy alternates who starts, so a second game in the
+    # same test would open with an unscripted (random) move by Loopy.
+    def test_a_true_claim_is_spoken_as_is(self):
+        self.assertIn("Corner's mine. Try harder.", self.said_for(5, "[play: 1] Corner's mine. Try harder."))
+
+    def test_a_true_claim_about_the_center(self):
+        self.assertIn("The center, mine.", self.said_for(1, "[play: 5] The center, mine."))
+
+    def test_talking_about_the_users_move_is_fine(self):
+        said = self.said_for(2, "[play: 5] Top-middle? Bold. Wrong, but bold. The center's mine.")
+        self.assertIn("Top-middle? Bold.", said)
+
+    def test_comment_fits(self):
+        fits = brain.comment_fits
+        self.assertFalse(fits("Corner's mine.", cell=5, user_move=1))     # claims a corner, took the center
+        self.assertTrue(fits("Your corner won't save you.", cell=5, user_move=1))
+        self.assertFalse(fits("I'll take top-left.", cell=9, user_move=2))
+        self.assertTrue(fits("Bottom-right, mine.", cell=9, user_move=2))
+        self.assertTrue(fits("Cute move. Try to keep up.", cell=4, user_move=8))  # names nothing
+        self.assertFalse(fits("The center is mine now.", cell=1, user_move=5))   # the user has the center
+
+
+class Threats(GameTest):
+    """Reported: X in 1 and 7, and Loopy played 9 instead of blocking 4."""
+
+    def test_winning_cells(self):
+        game = brain._example_board("X--O--X--")      # X in 1 and 7, but O already blocks at 4
+        self.assertEqual(game.winning_cells("X"), [])
+        game = brain._example_board("X---O-X--")      # X in 1 and 7, O in 5
+        self.assertEqual(game.winning_cells("X"), [4])
+        self.assertEqual(game.winning_cells("O"), [])
+        game = brain._example_board("XXO-O---X")      # O in 3 and 5: 7 wins
+        self.assertEqual(game.winning_cells("O"), [7])
+
+    def test_the_model_is_told_to_block(self):
+        msg = brain._board_message(brain._example_board("X---O-X--"), "", user_move=7)
+        self.assertIn("Block 4 or they win!", msg)
+
+    def test_a_win_beats_a_block(self):
+        msg = brain._board_message(brain._example_board("XXO-O---X"), "", user_move=9)
+        self.assertIn("Play 7 to win!", msg)
+        self.assertNotIn("Block", msg)
+
+    def test_no_threat_no_hint(self):
+        msg = brain._board_message(brain._example_board("-X-------"), "", user_move=2)
+        self.assertNotIn("Block", msg)
+        self.assertNotIn("to win", msg)
+
+
+class ShortBoardMessages(GameTest):
+    """Requested: Gemma took 15-60 s per move, mostly reading the board message."""
+
+    def test_the_board_message_is_short(self):
+        msg = brain._board_message(brain._example_board("X---O-X--"), "", user_move=7,
+                                   said_before=["One.", "Two.", "Three.", "Four."])
+        self.assertLess(len(msg.split()), 45)
+        self.assertIn('Not again: "Four."', msg)           # only the last comment
+        self.assertNotIn('"Three."', msg)
+
+    def test_a_move_only_adds_to_the_conversation(self):
+        # Changing anything earlier would make the model re-read from there.
+        self.start()
+        self.turn("put a cross in 1", "[move: 1]", "[play: 5] The center's mine.")
+        before = [dict(m) for m in self.brain._history]
+        self.turn("put a cross in 9", "[move: 9]", "[play: 3] Top-right, mine.")
+        self.assertEqual(self.brain._history[:len(before)], before)
+        boards = [m for m in self.brain._history if m["content"].startswith(brain.BOARD_START)]
+        self.assertIn("The user took 9", boards[-1]["content"])
 
 
 class StartingWithoutAsking(GameTest):
@@ -345,8 +430,8 @@ class Moves(GameTest):
         self.start()
         self.turn("put a cross in 5", "[move: 5]", "[play: 1] Corner!")
         board_msg = self.last_system_message(call=1)
-        self.assertIn("4 | X | 6", board_msg)
-        self.assertIn("Free cells: 1, 2, 3, 4, 6, 7, 8, 9", board_msg)
+        self.assertIn("4 X 6", board_msg)
+        self.assertIn("The user took 5 (the center).", board_msg)
 
     def test_your_move_on_a_taken_cell_is_refused(self):
         self.start()
@@ -373,7 +458,8 @@ class IllegalMovesByLoopy(GameTest):
         self.turn("put a cross in 5", "[move: 5]", "[play: 5] Middle!", "[play: 3] Okay, 3.")
         retry_msg = self.last_system_message(call=2)
         self.assertIn("Your move 5 isn't allowed: cell 5 is taken by X", retry_msg)
-        self.assertNotIn("5,", retry_msg.split("Free cells:")[1])  # 5 isn't offered again
+        board = retry_msg.splitlines()[1:4]                  # the board shows 5 as taken (X)
+        self.assertEqual(board[1].split()[1], "X")
 
     def test_not_a_cell_at_all(self):
         self.start()

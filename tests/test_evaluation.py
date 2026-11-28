@@ -41,7 +41,8 @@ class Scoring(unittest.TestCase):
 
     def test_silence_and_spoken_tags_always_fail(self):
         self.assertIn("silent: said nothing", self.scored(record(reply="")).failures)
-        for leak in ["[none] hi", "Okay [do: close chrome]", "system: done", "User: yes"]:
+        for leak in ["[none] hi", "Okay [do: close chrome]", "system: done", "User: yes",
+                     "I need you to say 'check: battery' to look it up."]:
             self.assertTrue(self.scored(record(reply=leak)).failures, leak)
 
     def test_ordinary_words_arent_leaks(self):

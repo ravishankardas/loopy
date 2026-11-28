@@ -62,24 +62,65 @@ def get_voice(voice_id: str) -> Voice | None:
     return next((v for v in VOICES if v.id == voice_id), None)
 
 
-# Conversation model: Llama 3.2 3B Instruct, 4-bit (~1.9 GB on disk, ~2.4 GB RAM).
-LLM_NAME = "Llama 3.2 3B Instruct (Q4_K_M)"
-LLM_FILE = "Llama-3.2-3B-Instruct-Q4_K_M.gguf"
-_LLM_URL = f"https://huggingface.co/bartowski/Llama-3.2-3B-Instruct-GGUF/resolve/main/{LLM_FILE}"
+@dataclass(frozen=True)
+class LLM:
+    """A conversation model: a 4-bit GGUF file run by llama.cpp."""
+    id: str            # used in settings and on the command line
+    name: str          # shown to people
+    repo: str          # Hugging Face repo with the GGUF file
+    file: str
+    size: str          # download size, for `loopy setup`
+    system_role: bool = True   # False: the chat format has no "system" role (Gemma)
+
+    @property
+    def path(self) -> Path:
+        return DATA_DIR / "llm" / self.file
+
+    @property
+    def installed(self) -> bool:
+        return self.path.is_file()
+
+    @property
+    def url(self) -> str:
+        return f"https://huggingface.co/{self.repo}/resolve/main/{self.file}"
+
+
+LLMS = [
+    LLM("llama-3.2-3b", "Llama 3.2 3B Instruct (Q4_K_M)", "bartowski/Llama-3.2-3B-Instruct-GGUF",
+        "Llama-3.2-3B-Instruct-Q4_K_M.gguf", "1.9 GB"),
+    LLM("gemma-3-4b", "Gemma 3 4B Instruct (Q4_K_M)", "bartowski/google_gemma-3-4b-it-GGUF",
+        "google_gemma-3-4b-it-Q4_K_M.gguf", "2.5 GB", system_role=False),
+]
+DEFAULT_LLM = LLMS[0]
+
+
+def get_llm(llm_id: str | None) -> LLM | None:
+    return next((m for m in LLMS if m.id == llm_id), None)
+
+
+def llm_for_file(path: Path) -> LLM | None:
+    return next((m for m in LLMS if m.file == Path(path).name), None)
+
+
+def active_llm() -> LLM:
+    """The model chosen with `loopy setup --model` (settings "llm"), or the default."""
+    from loopy import settings  # settings imports this module
+    return get_llm(settings.load().get("llm")) or DEFAULT_LLM
 
 
 def llm_path() -> Path:
-    return DATA_DIR / "llm" / LLM_FILE
+    return active_llm().path
 
 
 def llm_installed() -> bool:
-    return llm_path().is_file()
+    return active_llm().installed
 
 
-def install_llm(force: bool = False, progress: Progress | None = None) -> None:
-    if llm_installed() and not force:
+def install_llm(llm: LLM | None = None, force: bool = False, progress: Progress | None = None) -> None:
+    llm = llm or active_llm()
+    if llm.installed and not force:
         return
-    _download(_LLM_URL, llm_path(), progress)
+    _download(llm.url, llm.path, progress)
 
 
 # Speech-to-text: faster-whisper "base.en", int8 on CPU (~145 MB on disk).

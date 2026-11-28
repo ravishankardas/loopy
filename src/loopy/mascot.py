@@ -130,6 +130,7 @@ def _clip_path() -> QPainterPath:
 
 
 class Mascot(QWidget):
+    quit_requested = Signal()   # Quit in the right-click menu (the app logs it, then quits)
     speak_requested = Signal(str)
 
     def __init__(self):
@@ -519,5 +520,5 @@ class Mascot(QWidget):
         if self.menu_extender:
             self.menu_extender(menu)
         menu.addSeparator()
-        menu.addAction("Quit", QApplication.quit)
+        menu.addAction("Quit", self.quit_requested.emit)
         menu.exec(event.globalPos())

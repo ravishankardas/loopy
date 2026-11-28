@@ -23,6 +23,7 @@ from PySide6.QtWidgets import QApplication, QInputDialog, QMenu
 from loopy import models, settings, wake
 from loopy.game import X_COLOR, BoardWindow, Celebration
 from loopy.listener import KNOCK_ABOVE_NOISE, KNOCK_PEAK
+from loopy.log import logger, setup_logging
 from loopy.mascot import Activity, Mascot, State
 from loopy.models import Voice
 from loopy.snake import SnakeWindow
@@ -30,17 +31,20 @@ from loopy.snake import SnakeWindow
 if TYPE_CHECKING:  # loaded lazily at runtime (heavy imports)
     from loopy.brain import Brain
     from loopy.sounds import Clip
-    from loopy.stt import Transcriber
+    from loopy.stt import LiveTranscription, Transcriber
     from loopy.tts import Speaker
 
 DEFAULT_SLEEP_AFTER = 60  # seconds without activity before Loopy dozes off
 GAME_SLEEP_AFTER = 300    # ...longer during a game, so you have time to think
+# Seconds between live transcription passes while the user talks (partial text
+# in the bubble), or None for only the pass when they pause. See LiveTranscription.
+LIVE_PASS_EVERY: float | None = None
 SNAKE_ANSWER_SECONDS = 30 # "still playing snake?" with no answer: close it
 
 
-def _log(text: str = "", end: str = "\n") -> None:
-    """The conversation, printed in the terminal Loopy was started from."""
-    print(text, end=end, flush=True)
+def _log(text: str = "") -> None:
+    """One line of the conversation: in the terminal and the log file."""
+    logger.opt(depth=1).info(text)  # depth=1: report the caller's file:line, not this helper's
 
 
 def _describe_game_event(event: tuple) -> str:
@@ -76,6 +80,7 @@ class Assistant(QObject):
     _utterance = Signal(object)              # np.ndarray of audio
     _mic_level = Signal(float)               # 0..1 while talking
     _heard = Signal(str)                     # transcription result
+    _hearing_so_far = Signal(str)            # partial transcription while the user talks
     _brain_ready = Signal(str)               # model finished loading ("" = ok, else the error)
     _knock = Signal(float)                   # someone hit the laptop (peak level)
     _game_event = Signal(object)             # tic-tac-toe event tuple, see brain.GameEvent
@@ -117,6 +122,7 @@ class Assistant(QObject):
         self._utterance.connect(self._on_utterance)
         self._mic_level.connect(mascot.set_level)
         self._heard.connect(self._on_heard)
+        self._hearing_so_far.connect(self._on_hearing_so_far)
         self._brain_ready.connect(self._on_brain_ready)
         self._game_event.connect(self._on_game_event)
         self.board: BoardWindow | None = None
@@ -142,7 +148,7 @@ class Assistant(QObject):
             self.brain = brain = brain_module.Brain(models.llm_path())
 
             def load_brain():
-                _log("Loading Loopy's brain (Llama 3.2 3B)...")
+                _log(f"Loading Loopy's brain ({models.active_llm().name})...")
                 started = time.monotonic()
                 try:
                     brain.load()
@@ -156,6 +162,7 @@ class Assistant(QObject):
 
         # Ears: always-on listener -> Whisper.
         self.transcriber: Transcriber | None = None
+        self.live: LiveTranscription | None = None
         self.listener = None
         self.mic_error = None
         if models.stt_installed():
@@ -164,8 +171,13 @@ class Assistant(QObject):
 
             self.transcriber = stt.Transcriber(models.stt_path())
             threading.Thread(target=self.transcriber.load, daemon=True).start()  # warm up
+            # Streaming: transcribe while the user talks, so the text is ready
+            # (nearly) as soon as they stop. See stt.LiveTranscription.
+            self.live = stt.LiveTranscription(self.transcriber, on_partial=self._hearing_so_far.emit)
             self.listener = Listener(
                 on_utterance=self._utterance.emit,
+                on_partial=self.live.update,
+                partial_every=LIVE_PASS_EVERY,
                 on_speech_start=self._speech_detected.emit,
                 on_level=self._mic_level.emit,
                 on_knock=self._knock.emit,
@@ -318,7 +330,10 @@ class Assistant(QObject):
 
     def _on_utterance(self, audio: np.ndarray) -> None:
         self._hearing = False
+        live = self.live
+        assert live is not None, "speech only reaches here once the transcriber exists"
         if len(audio) == 0:  # too short to be speech
+            live.cancel()
             self._back_to_rest()
             return
         self._transcribing = True
@@ -326,9 +341,12 @@ class Assistant(QObject):
             self._busy()
             self.mascot.set_state(State.WORKING)
         self._refresh_status()
-        transcriber = self.transcriber
-        assert transcriber is not None, "speech only reaches here once the transcriber exists"
-        threading.Thread(target=lambda: self._heard.emit(transcriber.transcribe(audio)), daemon=True).start()
+        threading.Thread(target=lambda: self._heard.emit(live.finish(audio)), daemon=True).start()
+
+    def _on_hearing_so_far(self, text: str) -> None:
+        """Show what Loopy has heard so far while the user is still talking."""
+        if self.awake and self._hearing and self.mascot.state() == State.LISTENING:
+            self.mascot.show_bubble(f"{text}…", 0)
 
     def _on_heard(self, text: str) -> None:
         self._transcribing = False
@@ -394,20 +412,16 @@ class Assistant(QObject):
         speak = stream.feed if stream else self._thought.emit
         self._spoken = ""
 
-        line_open = [False]  # a "Loopy: ..." line is being printed
+        line: list[str] = []  # Loopy's words so far; logged as one line once the reply (or a part) ends
 
-        def out(piece: str) -> None:  # to the voice and the terminal, as it's written
+        def out(piece: str) -> None:  # to the voice as it's written, and to the log
             speak(piece)
-            if not line_open[0]:
-                _log("Loopy: ", end="")
-                piece = piece.lstrip()
-                line_open[0] = True
-            _log(piece, end="")
+            line.append(piece)
 
         def end_line():
-            if line_open[0]:
-                _log()
-                line_open[0] = False
+            if text := "".join(line).strip():
+                _log(f"Loopy: {text}")
+            line.clear()
 
         def on_event(*event):  # logged here, in order with the speech, then shown on the board
             if description := _describe_game_event(event):
@@ -434,7 +448,7 @@ class Assistant(QObject):
             except Exception as exc:  # keep Loopy alive whatever happens
                 out(" Sorry, my brain got a bit tangled. Can you say that again?")
                 end_line()
-                _log(f"       [brain error: {exc!r}]")
+                logger.exception(f"       [brain error: {exc!r}]")
                 turn = None
             finally:
                 if stream:
@@ -796,6 +810,12 @@ class Assistant(QObject):
         self.say(f"Hi, I'm Loopy. This is the {name} voice.")
 
 
+def _quit(app: QApplication, why: str) -> None:
+    """Quit, saying why in the log (a silent exit is a mystery otherwise)."""
+    logger.info(f"── Quitting ({why}) ──")
+    app.quit()
+
+
 def _quit_on_ctrl_c(app: QApplication) -> QTimer:
     """Make Ctrl+C in the terminal quit the app.
 
@@ -804,7 +824,7 @@ def _quit_on_ctrl_c(app: QApplication) -> QTimer:
     """
     for sig in (signal.SIGINT, getattr(signal, "SIGBREAK", None)):  # SIGBREAK = Ctrl+Break on Windows
         if sig is not None:
-            signal.signal(sig, lambda *_: app.quit())
+            signal.signal(sig, lambda *_: _quit(app, "Ctrl+C in the terminal"))
     wake_timer = QTimer()
     wake_timer.timeout.connect(lambda: None)
     wake_timer.start(200)
@@ -836,11 +856,8 @@ def run(start_with_game: str | None = None) -> int:
     """Start Loopy. With start_with_game ("tic-tac-toe" or "snake", from
     `loopy tic-tac-toe` / `loopy snake`), it jumps straight into that game
     once its brain has loaded, instead of saying hello."""
-    # The Windows console can't encode some characters a model may write
-    # (curly quotes, accents...); print a "?" instead of crashing.
-    for s in (sys.stdout, sys.stderr):
-        if hasattr(s, "reconfigure"):
-            s.reconfigure(errors="replace")
+    setup_logging()  # terminal + log file; also logs crashes in any thread
+    logger.debug(f"Loopy starting: Python {sys.version.split()[0]}, {sys.platform}")
     # Sound clips: on Windows use its own media engine; Qt's default (FFmpeg)
     # prints decoder chatter into the terminal, cluttering the conversation log.
     if sys.platform == "win32":
@@ -850,6 +867,7 @@ def run(start_with_game: str | None = None) -> int:
         _log(f"[note] {hint}")
     app = QApplication(sys.argv)
     mascot = Mascot()
+    mascot.quit_requested.connect(lambda: _quit(app, "Quit from the menu"))
     assistant = Assistant(mascot)
     assistant.start_with_game = start_with_game  # read once the brain is ready (inside app.exec)
     app.aboutToQuit.connect(assistant.shutdown)

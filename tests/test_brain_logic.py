@@ -64,6 +64,17 @@ class TagsAreNeverSpoken(unittest.TestCase):
         self.assertEqual(streamed("none You've got 61 GB free."), "You've got 61 GB free.")
         self.assertEqual(streamed("None: Sure thing!"), "Sure thing!")
 
+    def test_tag_said_in_words_is_never_spoken(self):
+        # Reported: "I need you to say 'check: battery' to look it up." Streamed
+        # piece by piece, "check:" must not slip out before "battery" arrives.
+        self.assertEqual(streamed("[none] I can't guess. I need you to say 'check: battery' to look it up."),
+                         "I can't guess. I need you to say")
+        self.assertEqual(streamed("[none] Sure. do: close chrome"), "Sure.")
+
+    def test_ordinary_colons_are_kept(self):
+        self.assertEqual(streamed("[none] Here's what to do: rest a bit."), "Here's what to do: rest a bit.")
+        self.assertEqual(streamed("[none] Let me check: yep, all good."), "Let me check: yep, all good.")
+
     def test_tag_in_the_middle_of_a_reply(self):
         # Reported (weather): "...I can check to find out. [check: time]"
         self.assertEqual(streamed("[none] I'm not sure, but I can check to find out. [check: time]"),
@@ -91,6 +102,31 @@ class TagsAreNeverSpoken(unittest.TestCase):
     def test_long_bracketed_text_that_isnt_a_tag_is_kept(self):
         text = "[none] An unclosed [bracket that goes on and on and on for a long long long long time"
         self.assertEqual(streamed(text), text[len("[none] "):])
+
+
+class MarkdownIsNotSpoken(unittest.TestCase):
+    def test_emphasis_stars_are_dropped(self):
+        self.assertEqual(streamed("[none] Oh, you're *trying* to win? How **utterly** pathetic."),
+                         "Oh, you're trying to win? How utterly pathetic.")
+
+
+class GameStartIsNotSaidTwice(unittest.TestCase):
+    """The app explains the rules after [game: start], so the model's own
+    explanation is cut (Gemma: "You're X, I'm O. Where do you want to go first?")."""
+
+    def test_rules_talk_is_cut(self):
+        raw = "[game: start] Alright, let's do this! You're X, I'm O. Where do you want to go first?"
+        self.assertEqual(streamed(raw), "Alright, let's do this!")
+
+    def test_a_plain_reaction_is_kept(self):
+        self.assertEqual(streamed("[game: start] Tic-tac-toe? Oh, you want to lose. Fine."),
+                         "Tic-tac-toe? Oh, you want to lose. Fine.")
+
+    def test_only_rules_says_nothing(self):
+        self.assertEqual(streamed("[game: start] Pick a number from 1 to 9."), "")
+
+    def test_stopping_a_game_is_not_held(self):
+        self.assertEqual(streamed("[game: stop] Okay, good game!"), "Okay, good game!")
 
 
 # ------------------------------------------------- ask before every action

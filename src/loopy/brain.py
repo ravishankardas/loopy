@@ -42,7 +42,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
-from loopy import actions, checks
+from loopy import actions, checks, models
 from loopy.game import CELL_NAMES, TicTacToe
 
 if TYPE_CHECKING:
@@ -115,7 +115,8 @@ When asked what you can do (or how you can help), tell them all of it: you can {
 
 You can play tic-tac-toe with the user on a board that appears on screen (no permission needed).
 Speech recognition often mishears it ("tiktok toe", "tick tock toe", "tic-tock-toe", "tic tac"). When they want to play, reply with [game: start]
-and the real board appears. Never draw a board in text and never play a game in words yourself.
+and the real board appears; never correct the name, it's the voice's mistake, not theirs.
+"Do you want to play …?" is them inviting you: always say yes, with [game: start]. Never draw a board in text and never play a game in words yourself.
 Cells are numbered 1 to 9: 1 top-left, 2 top-middle, 3 top-right, 4 middle-left, 5 center, 6 middle-right,
 7 bottom-left, 8 bottom-middle, 9 bottom-right. The user is X, you are O. When you name a cell in a comment, use these names.
 Try to win: get three O's in a row, and block the user when they have two X's in a row.
@@ -141,6 +142,35 @@ The example conversation below shows how to reply; it's not part of the real con
 
 
 EXAMPLE_TAUNT = "Top-middle? Bold. Wrong, but bold. The center's mine."
+EXAMPLE_BLOCK = "Two in a row? Adorable. Blocked."
+
+# Where a game comment says a move went, checked against the board before
+# it's spoken (reported: "Corner's mine." while taking the center).
+_CORNERS, _CENTER = {1, 3, 7, 9}, {5}
+_CLAIM = re.compile(r"\b(mine|my|i'll take|i take|i'm taking|taking|grabbing|i'll grab)\b")
+
+
+def _cells_named(sentence: str) -> list[set[int]]:
+    """The cells a sentence talks about: "corner" -> {1, 3, 7, 9}, "top-left" -> {1}."""
+    s = sentence.lower().replace("-", " ")
+    named = [{n} for n, name in CELL_NAMES.items() if n != 5 and name.replace("-", " ") in s]
+    if "corner" in s:
+        named.append(_CORNERS)
+    if re.search(r"\bcent(er|re)\b", s):
+        named.append(_CENTER)
+    return named
+
+
+def comment_fits(text: str, cell: int, user_move: int | None) -> bool:
+    """Does Loopy's game comment describe the board truthfully? A sentence
+    that claims a cell ("Corner's mine.") must name Loopy's own move; one
+    about the user's move ("Top-middle? Bold.") may name theirs."""
+    for sentence in re.split(r"(?<=[.!?])\s+", text):
+        claims = bool(_CLAIM.search(sentence.lower()))
+        allowed = {cell} if claims or user_move is None else {cell, user_move}
+        if any(not cells & allowed for cells in _cells_named(sentence)):
+            return False
+    return True
 
 
 def _examples() -> list[dict]:
@@ -180,6 +210,8 @@ def _examples() -> list[dict]:
         u("no never mind"), a("[none] No problem! So, what's on your mind?"),
         u("play that tiktok toe game"), a("[game: start] Tic-tac-toe? Oh, you want to lose. Fine."),
         u("let's stop playing"), a("[game: stop] Okay, good game!"),
+        u("wanna play tic tac with me?"), a("[game: start] With you? Sure, I could use an easy win."),
+        u("let's stop playing"), a("[game: stop] Okay, good game!"),
         u("can we play snake"), a("[game: snake] Ooh, snake! Show me what you've got!"),
         a(f"[none] {Brain.SNAKE_STILL_PLAYING}"),
         {"role": "system", "content": "The snake game is paused: the user stopped steering. If they want to keep "
@@ -198,11 +230,15 @@ def _examples() -> list[dict]:
         u("the top left corner"), a("[move: 1]"),
         {"role": "system", "content": _board_message(_example_board("XX--O----"), "", user_move=1,
                                                      said_before=[EXAMPLE_TAUNT])},
-        a("[play: 2] Top-middle, mine. Try to keep up."),
-        {"role": "system", "content": _board_message(_example_board("XX--O----"),
-                                                     "Your move 2 isn't allowed: cell 2 is taken by X.", user_move=1,
-                                                     said_before=[EXAMPLE_TAUNT])},
         a("[play: 3] Two in a row? Adorable. Blocked."),
+        u("bottom right"), a("[move: 9]"),
+        {"role": "system", "content": _board_message(_example_board("XXO-O---X"), "", user_move=9,
+                                                     said_before=[EXAMPLE_TAUNT, EXAMPLE_BLOCK])},
+        a("[play: 9] Bottom-right's mine."),
+        {"role": "system", "content": _board_message(_example_board("XXO-O---X"),
+                                                     "Your move 9 isn't allowed: cell 9 is taken by X.", user_move=9,
+                                                     said_before=[EXAMPLE_TAUNT, EXAMPLE_BLOCK])},
+        a("[play: 7] Bottom-left, and that's three. Game over, sweetie."),
         u("let's stop playing"), a("[game: stop] Okay, good game!"),
         # After a game: declining the rematch, or "close", closes the board (not Chrome).
         u("let's play tic tac toe"), a("[game: start] Back for more? Okay."),
@@ -223,20 +259,34 @@ def _example_board(layout: str) -> TicTacToe:
     return game
 
 
+BOARD_START = "Board (you're O):"
+
+
 def _board_message(game: TicTacToe, problem: str, user_move: int | None = None,
                    said_before: Sequence[str] = ()) -> str:
-    """What the model is shown when it's Loopy's turn. It includes the
-    user's last move (so the trash talk can tease it) and what Loopy already
-    said this game (so it doesn't repeat itself)."""
-    free = ", ".join(map(str, game.free()))
-    move = f"The user just put X in {user_move} ({CELL_NAMES[user_move]}). " if user_move else ""
-    repeat = ("You already said: " + " / ".join(f'"{s}"' for s in said_before[-4:])
-              + ". Say something new. ") if said_before else ""
-    return (f"{problem + ' ' if problem else ''}Tic-tac-toe board (you are O, the user is X):\n"
-            f"{game.describe()}\n"
-            f"{move}It's your turn. Free cells: {free}. Pick one of them: reply with the play tag and its number, "
-            "then one short, snippy, sassy line of trash talk roasting their move or bragging about yours. "
-            f"{repeat}").strip()
+    """What the model is shown when it's Loopy's turn: the board, the user's
+    last move (so the trash talk can tease it), any win or must-block, and
+    what Loopy already said this game (so it doesn't repeat itself).
+
+    Kept short on purpose: the model reads it on every move, and on a laptop
+    CPU reading is the slow part (~20 tokens/s for Gemma 3 4B). How to reply
+    is in the system prompt, not repeated here."""
+    # Free cells show as their number, so the board itself lists them.
+    lines = [BOARD_START, game.describe().replace(" | ", " ")]
+    news = f"The user took {user_move} ({CELL_NAMES[user_move]})." if user_move else ""
+    # A 3B model misses threats ("X in 1 and 7, and it played 9"), so the code
+    # spots them and says so; the model still picks the move.
+    if win := game.winning_cells("O"):
+        news += f" Play {win[0]} to win!"
+    elif block := game.winning_cells("X"):
+        news += f" Block {_and([str(c) for c in block])} or they win!"
+    if news.strip():
+        lines.append(news.strip())
+    if problem:
+        lines.append(problem)
+    repeat = f' Not again: "{said_before[-1]}"' if said_before else ""
+    lines.append(f"Your move: play tag + a free number, then a sassy line of trash talk.{repeat}")
+    return "\n".join(lines)
 
 
 @dataclass
@@ -250,6 +300,10 @@ class Turn:
 class Brain:
     def __init__(self, model_path: Path):
         self._model_path = Path(model_path)
+        # Gemma's chat format has no "system" role: those messages are folded
+        # into the user's turns (see _fold_system).
+        known = models.llm_for_file(self._model_path)
+        self._fold_system = known is not None and not known.system_role
         self._llm: Llama | None = None
         self.warmup_source: str | None = None  # "saved" (fast start) or "fresh"
         self.warmup_path: Path | None = None   # the saved warm-up file, once written
@@ -321,7 +375,7 @@ class Brain:
             "n_ctx": N_CTX,
         }, sort_keys=True)
         key = hashlib.sha256(fingerprint.encode("utf-8")).hexdigest()[:16]
-        return self._model_path.parent / f"warmup-{key}.state"
+        return self._model_path.parent / f"warmup-{self._model_path.stem}-{key}.state"
 
     def _restore_warmup(self, warmup: list[dict]) -> bool:
         assert self._llm is not None
@@ -352,7 +406,12 @@ class Brain:
             tmp.unlink(missing_ok=True)
             self.warmup_error = repr(exc)
             return  # not saved this time; Loopy works anyway
-        for old in path.parent.glob("warmup-*.state"):  # outdated copies
+        # Outdated copies for this model (each model keeps its own), and files
+        # from before warm-ups were named per model ("warmup-<key>.state").
+        legacy = re.compile(r"warmup-[0-9a-f]{16}\.state")
+        stale = [*path.parent.glob(f"warmup-{self._model_path.stem}-*.state"),
+                 *(f for f in path.parent.glob("warmup-*.state") if legacy.fullmatch(f.name))]
+        for old in stale:
             if old != path:
                 old.unlink(missing_ok=True)
         gc.collect()
@@ -574,8 +633,12 @@ class Brain:
         problem = ""
         for _ in range(MAX_PLAY_TRIES):
             board = _board_message(game, problem, user_move=user_move, said_before=self._game_comments)
+            # Old boards stay: the model reuses its cache up to the first change
+            # in the conversation, so deleting an old board would make it re-read
+            # everything after it (~40 extra tokens a move, ~2.5 s on a laptop CPU).
             self._history.append({"role": "system", "content": board})
-            gate = self._generate_with_words(llm, self._out, validate_play=game.is_free)
+            gate = self._generate_with_words(llm, self._out, validate_play=game.is_free,
+                                             play_words=lambda cell, text: self._true_comment(cell, text, user_move))
             cell = gate.cell if gate.kind == "play" else None
             if cell is not None and game.is_free(cell):
                 if not gate.spoken:  # still silent after the retries: say where it went
@@ -603,6 +666,14 @@ class Brain:
             self._game_over()
         else:
             self._on_event("your_turn")
+
+    def _true_comment(self, cell: int, text: str, user_move: int | None) -> str:
+        """Loopy's comment for its move, if it describes the board truthfully;
+        otherwise a plain line that does."""
+        if comment_fits(text, cell, user_move):
+            return text
+        name = CELL_NAMES[cell]
+        return f"{name[0].upper()}{name[1:]}'s mine. Try to keep up."
 
     def _board(self) -> TicTacToe:
         """The game being played (only called while one is on)."""
@@ -672,12 +743,13 @@ class Brain:
         self._history = kept
 
     def _generate_with_words(self, llm, on_text: TextOut,
-                             validate_play: Callable[[int | None], bool] | None = None) -> "_Gate":
+                             validate_play: Callable[[int | None], bool] | None = None,
+                             play_words: Callable[[int, str], str] | None = None) -> "_Gate":
         """Like _generate, but a reply that should have words and has none
         (e.g. only "[ask: ACTION]", or a move with no comment) is asked for
         again, up to EMPTY_RETRIES more times."""
         for attempt in range(1 + EMPTY_RETRIES):
-            gate = self._generate(llm, on_text, validate_play)
+            gate = self._generate(llm, on_text, validate_play, play_words)
             # These need no words from the model: nothing goes after the tag, or
             # (for a real [ask: action]) Loopy asks its own question if needed.
             wordless = gate.kind in ("check", "move", "game", "ask") or gate.fake_board
@@ -692,7 +764,8 @@ class Brain:
             self._history.append({"role": "system", "content": note})
         return gate
 
-    def _generate(self, llm, on_text: TextOut, validate_play: Callable[[int | None], bool] | None = None) -> "_Gate":
+    def _generate(self, llm, on_text: TextOut, validate_play: Callable[[int | None], bool] | None = None,
+                  play_words: Callable[[int, str], str] | None = None) -> "_Gate":
         """One model reply, streamed through a fresh gate. Stops early when
         nothing more may be spoken (a [check], a [move], an illegal [play])."""
         first = [True]
@@ -705,7 +778,7 @@ class Brain:
             first[0] = False
             on_text(piece)
 
-        gate = _Gate(self.pending, spaced, validate_play)
+        gate = _Gate(self.pending, spaced, validate_play, play_words)
         raw = ""
         stream = llm.create_chat_completion(
             self._messages(self._history),
@@ -758,7 +831,59 @@ class Brain:
     def _messages(self, history: list[dict]) -> list[dict]:
         # Prompt + examples never change, so llama.cpp processes them only
         # once (at warm-up) and reuses them on every turn.
-        return [{"role": "system", "content": _system_prompt()}, *_examples(), *history]
+        messages = [{"role": "system", "content": _system_prompt()}, *_examples(), *history]
+        return _fold_system(messages) if self._fold_system else messages
+
+
+_TAG_WORD = r"(?:none|ask|do|check|game|move|play)"
+_TAG_TARGET = "|".join([*(re.escape(n) for n in actions.names() + checks.names()),
+                        "start", "stop", "snake", "[1-9]"])
+_QUOTE = "[\"'“‘]?"
+# Tag syntax said in words, without brackets: "I need you to say 'check:
+# battery'" (reported). A tag word, a colon, and something Loopy can do; so
+# "here's what to do: ..." is fine. Not inside [...] (those are stripped).
+TAG_TALK = re.compile(rf"(?<!\[)(?<!\[ ){_QUOTE}\b{_TAG_WORD}\s*:\s*{_QUOTE}\s*(?:{_TAG_TARGET})\b",
+                      re.IGNORECASE)
+# The start of one at the end of the text so far ("say 'check:", "do: close"):
+# held back until the next word shows whether it is one.
+_TARGET_FIRST_WORDS = "|".join(sorted({re.escape(n.split()[0]) for n in actions.names() if " " in n}))
+_TAG_TALK_START = re.compile(rf"(?<!\[)(?<!\[ ){_QUOTE}\b{_TAG_WORD}\s*:\s*{_QUOTE}\s*"
+                             rf"(?:(?:{_TARGET_FIRST_WORDS})\s+)?$", re.IGNORECASE)
+
+# In a [game: start] reply, the model explaining the rules itself ("You're X,
+# I'm O. Where do you want to go first?"): the app says that right after, so
+# it would be said twice. Only the model's words, never the user's.
+_GAME_RULES = re.compile(r"(?-i:\b[XO]\b)|\bnoughts?\b|\bcross(?:es)?\b|\bgo(?:es)? first\b|\bfirst move\b"
+                         r"|\byour (?:move|turn)\b|\bnumber\b|\bwhere do you want\b|\bpick a\b|\bcell\b|\bsquare\b",
+                         re.IGNORECASE)
+
+
+def _game_reaction(text: str) -> str:
+    """The model's reaction to starting a game, up to where it starts on the rules."""
+    kept = []
+    for sentence in re.split(r"(?<=[.!?])\s+", text.strip()):
+        if _GAME_RULES.search(sentence):
+            break
+        kept.append(sentence)
+    return " ".join(kept)
+
+
+def _fold_system(messages: list[dict]) -> list[dict]:
+    """For chat formats without a "system" role (Gemma), which also require
+    user and model turns to alternate: the first system message (the prompt)
+    stays first, as Gemma's template puts it in the first user turn; later
+    ones (lookup results, the board, game over) become notes in a user turn,
+    and back-to-back turns of the same role are joined."""
+    out: list[dict] = []
+    for i, m in enumerate(messages):
+        role, content = m["role"], m["content"]
+        if role == "system" and i > 0:
+            role, content = "user", f"(Note from Loopy's app, not said by the user) {content}"
+        if out and out[-1]["role"] == role and i > 0 and out[-1] is not out[0]:
+            out[-1] = {"role": role, "content": out[-1]["content"] + "\n\n" + content}
+        else:
+            out.append({"role": role, "content": content})
+    return out
 
 
 class _Gate:
@@ -769,10 +894,12 @@ class _Gate:
     MAX_TAG_CHARS = 60   # no closing "]" by then: it's not a tag
 
     def __init__(self, pending: str | None, on_text: TextOut,
-                 validate_play: Callable[[int | None], bool] | None = None):
+                 validate_play: Callable[[int | None], bool] | None = None,
+                 play_words: Callable[[int, str], str] | None = None):
         self._pending = pending
         self._on_text = on_text
         self._validate_play = validate_play  # set only when it's Loopy's turn to play
+        self._play_words = play_words        # checks Loopy's comment on its move (see finish)
         self.kind = "none"
         self.action: str | None = None
         self.checks: list[str] = []
@@ -787,7 +914,9 @@ class _Gate:
         self.stopped = False     # the model started writing a fake turn; ignore the rest
         self.fake_board = False  # it started drawing a tic-tac-toe board in text
         self._hold_ask = False   # [ask: ...]: hold the words until we know it's a question
-        self._ask_text = ""
+        self._hold_play = False  # [play: N]: hold the comment until it can be checked
+        self._hold_game = False  # [game: start]: hold the reaction until rules talk can be cut
+        self._ask_text = ""      # the held words
 
     @property
     def halt(self) -> bool:
@@ -810,8 +939,8 @@ class _Gate:
         end = len(raw)
         assert self._body_start is not None  # set by _read_tag
         body = raw[self._body_start:]
-        role, board = self._ROLE.search(body), self._FAKE_BOARD.search(body)
-        cut = min([m.start() for m in (role, board) if m], default=None)
+        role, board, talk = self._ROLE.search(body), self._FAKE_BOARD.search(body), TAG_TALK.search(body)
+        cut = min([m.start() for m in (role, board, talk) if m], default=None)
         if cut is not None:
             end = max(self._pos, self._body_start + cut)
             self.stopped = True
@@ -821,10 +950,13 @@ class _Gate:
             # is recognised before any of it is spoken (costs ~1 token).
             space = max(raw.rfind(" "), raw.rfind("\n"))
             end = max(self._pos, space + 1) if space >= 0 else self._pos
+            if start := _TAG_TALK_START.search(raw, self._pos, end):
+                end = max(self._pos, start.start())
         piece = raw[self._pos:end]
         self._pos = end
         if piece and not self._suppress:
-            self._emit(self._strip_tags(piece.replace("\r", " ").replace("\n", " ")))
+            # "*" is markdown emphasis (Gemma: "you're *trying*"): never spoken
+            self._emit(self._strip_tags(piece.replace("\r", " ").replace("\n", " ").replace("*", "")))
 
     def finish(self, raw: str) -> None:
         if self._body_start is None:  # never found a tag: treat it all as chat
@@ -842,6 +974,17 @@ class _Gate:
             text, self._ask_text = self._ask_text.strip(), ""
             if "?" in text and self.action and actions.is_named(self.action, text):
                 self._emit(text)
+        if self._hold_play:
+            # Loopy's comment on its own move: say it only if it describes the
+            # board truthfully ("Corner's mine." while taking the center isn't).
+            self._hold_play = False
+            text, self._ask_text = self._ask_text.strip(), ""
+            if text and self._play_words is not None and self.cell is not None:
+                self._emit(self._play_words(self.cell, text))
+        if self._hold_game:
+            self._hold_game = False
+            text, self._ask_text = self._ask_text.strip(), ""
+            self._emit(_game_reaction(text))
         self.spoken = self.spoken.strip()
 
     _TAG_START = re.compile(r"\[\s*(none|ask|do|check|game|move|play)\b", re.IGNORECASE)
@@ -873,7 +1016,7 @@ class _Gate:
         return out
 
     def _emit(self, piece: str) -> None:
-        if self._hold_ask:
+        if self._hold_ask or self._hold_play or self._hold_game:
             self._ask_text += piece  # decided in finish()
             return
         if not self.spoken:
@@ -919,6 +1062,7 @@ class _Gate:
             self.kind = "game"
             self.game_cmd = ("stop" if re.search(r"stop|end|quit|exit|close", action)
                              else "snake" if "snake" in action else "start")
+            self._hold_game = self.game_cmd == "start"
         elif kind in ("move", "play"):
             number = re.search(r"\d+", action)
             cell = int(number.group()) if number else None
@@ -930,6 +1074,8 @@ class _Gate:
                 self.kind, self.cell = "play", cell
                 if not self._validate_play(cell):
                     self._suppress = True  # illegal: its comment must not be spoken
+                elif self._play_words is not None:
+                    self._hold_play = True
         elif kind != "none" and action in actions.names():
             self.kind, self.action = kind, action
             if kind == "ask":

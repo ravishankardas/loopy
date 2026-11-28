@@ -3,8 +3,8 @@
     split_wake("Hey Loopy, open Chrome.")  ->  (True, "open chrome")
     split_wake("open chrome")              ->  (False, "open chrome")
 
-Whisper doesn't know the name "Loopy", so it may write it a few different
-ways; all of those count. The name must come first (after an optional
+The speech model doesn't know the name "Loopy", so it may write it a few
+different ways; all of those count. The name must come first (after an optional
 greeting), so "I said loopy earlier" doesn't wake it.
 """
 

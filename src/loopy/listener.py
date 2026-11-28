@@ -3,7 +3,7 @@
 A tiny voice-activity model (Silero, bundled with faster-whisper) checks every
 32 ms of audio for speech. When someone talks, audio is collected until they
 pause, then handed to `on_utterance`. Silence and background noise never
-reach Whisper, so idle CPU use stays near zero.
+reach speech-to-text, so idle CPU use stays near zero.
 
     listener = Listener(on_utterance=handle_audio)
     listener.start()
@@ -21,6 +21,7 @@ from dataclasses import dataclass
 
 import numpy as np
 import sounddevice as sd
+from loguru import logger
 
 SAMPLE_RATE = 16_000
 FRAME = 512                  # 32 ms: the chunk size the VAD model expects
@@ -30,6 +31,7 @@ END_FRAMES = 22              # ~700 ms of quiet ends an utterance
 PREROLL_FRAMES = 15          # keep ~480 ms from before speech was detected
 MAX_SECONDS = 15
 MIN_SECONDS = 0.4
+PAUSE_FRAMES = 6             # ~200 ms of quiet: probably done, so transcribe what was said (see on_partial)
 
 # Knock detection: hitting the laptop makes a spike in the mic that is short
 # (a few ms), sharp and much louder than the room. Same idea as the first two
@@ -102,12 +104,21 @@ class Listener:
         knock_peak: float = KNOCK_PEAK,
         knock_above_noise: float = KNOCK_ABOVE_NOISE,
         on_sound: Callable[[KnockReading], None] | None = None,
+        on_partial: Callable[[np.ndarray, int], None] | None = None,
+        partial_every: float | None = None,
     ):
         """Callbacks run on the listener thread. `on_utterance` gets mono
         float32 audio at 16 kHz, or an empty array if the speech turned out
         too short to be a command (so callers can undo on_speech_start).
-        `on_knock` gets the peak level when someone hits the laptop."""
+        `on_knock` gets the peak level when someone hits the laptop.
+        `on_partial` gets the utterance so far and where its speech ends (in
+        samples), for transcribing while the user talks: when they pause
+        (PAUSE_FRAMES of quiet, so the last call before on_utterance always
+        has all the speech) and, if `partial_every` is set, every that many
+        seconds while they speak."""
         self._on_utterance = on_utterance
+        self._on_partial = on_partial
+        self._partial_every = int(partial_every * SAMPLE_RATE / FRAME) if partial_every else 0
         self._on_speech_start = on_speech_start
         self._on_level = on_level
         self._on_knock = on_knock
@@ -181,7 +192,7 @@ class Listener:
                     self.feed(pending[:FRAME])
                 except Exception as exc:
                     # Never let one bad frame kill the thread: Loopy would go deaf.
-                    print(f"[loopy] listener error (still listening): {exc!r}", flush=True)
+                    logger.exception(f"[listener error, still listening: {exc!r}]")
                     self._reset()
                 pending = pending[FRAME:]
 
@@ -190,6 +201,7 @@ class Listener:
         self._voiced_run = 0
         self._quiet_run = 0
         self._voiced_total = 0
+        self._speech_end = 0             # frames: the last voiced frame of the utterance so far
         self._preroll: collections.deque = collections.deque(maxlen=PREROLL_FRAMES)
         self._utterance: list[np.ndarray] = []
         if self._vad is not None:
@@ -271,6 +283,7 @@ class Listener:
             if self._voiced_run >= START_FRAMES:
                 self._speaking = True
                 self._utterance = list(self._preroll)
+                self._speech_end = len(self._utterance)
                 self._voiced_total = self._voiced_run
                 self._quiet_run = 0
                 if self._on_speech_start:
@@ -285,6 +298,13 @@ class Listener:
         else:
             self._quiet_run = 0
             self._voiced_total += 1
+            self._speech_end = len(self._utterance)
+
+        if self._on_partial:
+            paused = self._quiet_run == PAUSE_FRAMES
+            every = self._partial_every and self._quiet_run == 0 and len(self._utterance) % self._partial_every == 0
+            if paused or every:
+                self._on_partial(np.concatenate(self._utterance), self._speech_end * FRAME)
 
         too_long = len(self._utterance) * FRAME >= MAX_SECONDS * SAMPLE_RATE
         if self._quiet_run >= END_FRAMES or too_long:

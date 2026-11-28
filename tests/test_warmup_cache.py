@@ -11,7 +11,9 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-import llama_cpp
+os.environ.setdefault("LOOPY_LOG_FILE", "")  # `loopy` commands run here mustn't write to the real log file
+
+import llama_cpp  # noqa: E402
 
 from loopy import brain
 from loopy.brain import Brain
@@ -145,8 +147,11 @@ class SavedWarmup(unittest.TestCase):
 
         from loopy import cli, models, settings
         voice = SimpleNamespace(label="Test voice", installed=True, id="test")
+        llm = SimpleNamespace(id="test", name="Test model", size="1 GB", installed=True, path=self.model)
         with mock.patch.object(models, "llm_path", lambda: self.model), \
              mock.patch.object(models, "llm_installed", lambda: True), \
+             mock.patch.object(models, "active_llm", lambda: llm), \
+             mock.patch.object(models, "install_llm", side_effect=AssertionError("tests never download")), \
              mock.patch.object(models, "stt_installed", lambda: True), \
              mock.patch.object(settings, "selected_voice", lambda: voice):
             return cli.main(["setup", *args])

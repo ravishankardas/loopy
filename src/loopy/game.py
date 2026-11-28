@@ -80,6 +80,15 @@ class TicTacToe:
             return "the game is over"
         return f"cell {cell} is taken by {self.cells[cell - 1]}"
 
+    def winning_cells(self, mark: str) -> list[int]:
+        """Free cells (1-9) where `mark` would complete three in a row."""
+        cells = set()
+        for line in WIN_LINES:
+            marks = [self.cells[i] for i in line]
+            if marks.count(mark) == 2 and marks.count(None) == 1:
+                cells.add(line[marks.index(None)] + 1)
+        return sorted(cells)
+
     def place(self, cell: int, mark: str) -> None:
         if not self.is_free(cell):
             raise ValueError(self.why_not(cell))

@@ -26,6 +26,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 import sounddevice as sd
+from loguru import logger
 from piper import PiperVoice
 
 TextCallback = Callable[[str], None] | None
@@ -214,7 +215,7 @@ class Speaker:
             try:
                 self._play(item)
             except Exception as exc:  # keep the worker alive
-                print(f"[loopy] speech failed: {exc}")
+                logger.exception(f"[speech failed: {exc}]")
             finally:
                 self._current = None
 

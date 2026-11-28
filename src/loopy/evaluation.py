@@ -17,7 +17,7 @@ touched, and lookups return fixed values, so the expected numbers are known.
     loopy eval --repeat 3       # each case 3 times (the model samples, so results vary)
     loopy eval --only safety    # one category
     loopy eval --speech         # end to end: each line is spoken (Piper), heard
-                                # (Whisper) and answered out loud (Piper)
+                                # (speech to text) and answered out loud (Piper)
 """
 
 from __future__ import annotations
@@ -35,6 +35,7 @@ from importlib import resources
 from pathlib import Path
 
 from loopy import actions, checks
+from loopy.brain import TAG_TALK
 
 # Fixed lookup results while the eval runs, so a reply can be checked for
 # the exact numbers ("57", "3:42") instead of trusting it.
@@ -46,8 +47,10 @@ FAKE_FACTS = {
     "disk": "C drive: 112 GB free of 237 GB; D drive: 401 GB free of 931 GB",
 }
 
-# Spoken text that gives away the machinery: a tag or an invented chat turn.
-LEAK = re.compile(r"\[\s*(none|ask|do|check|game|move|play)\b|\b(system|user|assistant)\s*:", re.IGNORECASE)
+# Spoken text that gives away the machinery: a tag (with or without brackets,
+# e.g. "say 'check: battery'") or an invented chat turn.
+LEAK = re.compile(r"\[\s*(none|ask|do|check|game|move|play)\b|\b(system|user|assistant)\s*:|"
+                  + TAG_TALK.pattern, re.IGNORECASE)
 SENTENCE_END = re.compile(r"[.!?]+(\s|$)")
 
 
@@ -106,9 +109,9 @@ class TurnRecord:
     failures: list[str] = field(default_factory=list)
     unsafe: bool = False                  # an action ran that the case didn't expect
     # Speech mode only (see SpeechRig):
-    heard: str | None = None              # what Whisper heard (the model answered this)
-    word_errors: int | None = None        # words Whisper got wrong (substituted/missing/extra)
-    stt_s: float | None = None            # Whisper's time
+    heard: str | None = None              # what speech to text heard (the model answered this)
+    word_errors: int | None = None        # words it got wrong (substituted/missing/extra)
+    stt_s: float | None = None            # speech-to-text time
     first_audio_s: float | None = None    # reply: text in -> first audio ready (model + Piper)
 
 
@@ -195,7 +198,7 @@ def word_errors(said: str, heard: str) -> int:
 
 
 def resample(audio, rate: int, to: int = 16_000):
-    """Linear resampling, e.g. Piper's 22,050 Hz to Whisper's 16,000 Hz."""
+    """Linear resampling, e.g. Piper's 22,050 Hz to the speech model's 16,000 Hz."""
     import numpy as np
     if rate == to or len(audio) == 0:
         return audio.astype(np.float32)
@@ -205,7 +208,7 @@ def resample(audio, rate: int, to: int = 16_000):
 
 class SpeechRig:
     """Real speech around the brain: the user's line is spoken by one Piper
-    voice and heard by Whisper; Loopy's reply goes through the app's own
+    voice and heard by speech to text; Loopy's reply goes through the app's own
     streaming logic (tts.SpeechStream) and is spoken by Loopy's voice."""
 
     def __init__(self, user_voice, transcriber, loopy_voice):
@@ -214,7 +217,7 @@ class SpeechRig:
         self.loopy_voice = loopy_voice    # PiperVoice: Loopy
 
     def hear(self, text: str) -> tuple[str, float]:
-        """Speak `text`, then transcribe it: (what Whisper heard, seconds)."""
+        """Speak `text`, then transcribe it: (what was heard, seconds)."""
         import numpy as np
         pieces, rate = [], 16_000
         for chunk in self.user_voice.synthesize(text):
@@ -255,14 +258,14 @@ class SpeechRig:
 
 def load_speech_rig() -> SpeechRig:
     """The installed models: Loopy's voice, a different installed voice for
-    the user (so Whisper isn't hearing Loopy talk to itself), and Whisper."""
+    the user (so it isn't hearing Loopy talk to itself), and speech to text."""
     from piper import PiperVoice
 
     from loopy import models, settings
     from loopy.stt import Transcriber
     loopy = settings.active_voice()
     if loopy is None or not models.stt_installed():
-        raise RuntimeError("Speech mode needs a voice and Whisper. Run: loopy setup")
+        raise RuntimeError("Speech mode needs a voice and speech to text. Run: loopy setup")
     others = [v for v in models.VOICES if v.installed and v.id != loopy.id]
     user = others[0] if others else loopy
     transcriber = Transcriber(models.stt_path())
@@ -291,7 +294,7 @@ def _sandbox(ran: list[str]) -> Iterator[None]:
 
 def run_case(brain, case: Case, run: int = 1, speech: SpeechRig | None = None) -> CaseResult:
     """Play one case from a clean slate and score every turn. With `speech`,
-    each line is spoken and heard first, and the model answers what Whisper
+    each line is spoken and heard first, and the model answers what was
     heard (so mishearings count, like in real use)."""
     brain.reset()
     brain._loopy_starts_next = False   # the user moves first in tic-tac-toe cases
@@ -443,10 +446,10 @@ def write_report(results: list[CaseResult], out_dir: Path, meta: dict) -> Path:
         lines += [
             "## Speech, end to end",
             "",
-            "Each line was spoken by a Piper voice and heard by Whisper (Loopy answered what Whisper heard); "
+            "Each line was spoken by a Piper voice and heard by speech to text (Loopy answered what it heard); "
             "the reply went through the app's streaming text-to-speech in Loopy's voice.",
             "",
-            f"Whisper word error rate: **{100 * sp['word_error_rate']:.1f}%** "
+            f"Speech-to-text word error rate: **{100 * sp['word_error_rate']:.1f}%** "
             f"({sp['heard_exactly']}/{sp['utterances']} lines heard exactly).",
             "",
             "| From you stopping talking to... | Median | 90th percentile |",
@@ -458,12 +461,12 @@ def write_report(results: list[CaseResult], out_dir: Path, meta: dict) -> Path:
             "| Step | Median | 90th percentile |",
             "|---|---|---|",
             f"| Waiting to be sure you've finished | {END_OF_SPEECH_S:.1f} s | {END_OF_SPEECH_S:.1f} s |",
-            f"| Speech to text (Whisper) | {stt_med} | {stt_p90} |",
+            f"| Speech to text | {stt_med} | {stt_p90} |",
             f"| First phrase written and voiced (Llama + Piper) | {reply_med} | {reply_p90} |",
             "",
         ]
         if sp["misheard"]:
-            lines += ["Misheard lines:", "", "| Said | Whisper heard |", "|---|---|"]
+            lines += ["Misheard lines:", "", "| Said | Heard |", "|---|---|"]
             lines += [f"| {said} | {heard or '(nothing)'} |" for said, heard in sp["misheard"]]
             lines.append("")
 
@@ -533,7 +536,7 @@ def default_meta(repeat: int) -> dict:
 
     from loopy import models
     return {
-        "model": models.LLM_NAME,
+        "model": models.active_llm().name,
         "commit": git_commit(),
         "date": datetime.now().strftime("%Y-%m-%d"),
         "repeat": repeat,
